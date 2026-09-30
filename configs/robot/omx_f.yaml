@@ -1,0 +1,54 @@
+# Real OMX-F follower driven through ros2_control (open_manipulator_bringup omx_f_follower_ai.launch.py).
+# The bridge (dlb/real/omx.py) solves IK on the MuJoCo twin (same kinematics as the OMX-F URDF: the URDF's
+# end_effector_link sits 2.0 cm below the twin's tcp site) and sends joint targets to the arm controller.
+ros_domain_id: 42
+joint_states_topic: /joint_states
+command_topic: /leader/joint_trajectory   # remapped to /arm_controller/joint_trajectory by the follower launch
+arm_joints: [joint1, joint2, joint3, joint4, joint5]  # same order and sign as the twin's Joint1..Joint5
+gripper_joint: gripper_joint_1
+
+# Gripper joint positions (rad), measured 2026-09-28: 0.0 = fingers touching, the jaw stops at ~0.50 fully open
+# (current-based position mode, 600 mA). held margin: to be checked by closing on the cube.
+gripper_open: 0.45
+gripper_closed: 0.0
+# A closed command that stops more than this far from gripper_closed means the fingers hold something.
+gripper_held_margin: 0.08
+
+# Tool pitch below horizontal for every IK solve: "begin" keeps the begin pose's pitch (as Show-Harness does), or
+# a number of degrees (90 = straight down). The wrist calibration is only valid for the pitch it was taken at.
+tool_pitch_deg: begin
+
+# Saved joint poses (rad, URDF convention), captured by hand with scripts/real_poses.py --capture <name>.
+# begin: over the workspace with the gripper pitched down (Show-Harness's example: fingertips ~22 cm out, ~8 cm up,
+# 60 deg down) -- REPLACE with a captured pose. rest: compact park.
+poses:
+  begin: [0.008, -0.515, 0.773, 0.649, 0.0]  # 52 deg pitch: the wrist camera looks ~straight down
+  rest: [0.0, -0.69, 0.82, 1.35, 0.0]
+begin_time_s: 3.0
+# tcp height (m above the table) for reaching / aligning over the cube: from the begin pose the cube fills half the
+# wrist image and the servo stopped with the cross on its edge; from 12 cm it spans about a third.
+observe_z: 0.12
+# Fingertip height (m, robot base frame) with the fingertips resting on the table: scripts/real_poses.py --z-floor.
+# null = the table is taken to be the base plane (z = 0).
+z_floor_m: 0.0001
+
+# Motion limits enforced by the bridge (on top of the twin's workspace clamp).
+max_tcp_speed: 0.04        # m/s, straight-line moves are timed from this
+min_move_time: 0.5         # s
+# intermediate moves (servo steps, travel): the image-based servo corrects afterwards, so no sag correction
+fast_tcp_speed: 0.07       # m/s
+fast_min_move_time: 0.3    # s
+fast_sag_trigger: 0.02     # rad: a fast move still gets one sag correction above this joint error
+rest_tolerance: 0.002      # rad per 0.1 s: the joints count as at rest below this
+sag_iterations: 3          # outer-loop corrections against gravity sag after each move
+sag_tolerance: 0.006       # rad: stop correcting below this joint error (~1 mm at the tool)
+sag_max_offset: 0.15       # rad: largest goal shift the correction may add
+max_goal_error: 0.08       # rad: a move that rests further than this from its goal fails (gravity sag ~0.04)
+arrive_timeout_extra: 3.0  # s beyond the planned duration before the move counts as failed
+max_joint_step: 0.6        # rad, refuse IK solutions that jump further than this in one move
+
+# USB cameras: device = N of /dev/videoN (v4l2-ctl --list-devices). wrist: on the gripper, calibrated by
+# scripts/calibrate_wrist_model.py. front: the overhead camera; the VLM marks its image, no calibration needed.
+cameras:
+  wrist: {device: 2, calibration: configs/robot/calib_wrist.yaml}
+  front: {device: 4, calibration: configs/robot/calib_front.yaml}

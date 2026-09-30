@@ -1,0 +1,12 @@
+openjev-cube-pick
+Copyright (c) 2026 Tamon Hattori. MIT License (see LICENSE).
+
+Third-party components:
+
+* dlb/sim/assets/omx/ — ROBOTIS OMX MJCF and STL meshes from
+  https://github.com/ROBOTIS-GIT/robotis_mujoco_menagerie (robotis_omx),
+  Copyright (c) 2025 ROBOTIS CO., LTD., Apache License 2.0 (see dlb/sim/assets/omx/LICENSE).
+  Modified: added tcp / fingertip sites and a wrist camera; keyframe moved to omx_scene.xml.
+
+* dlb/real/omx_kinematics.py — the author's port of Show-Harness
+  (https://github.com/showlab/Show-Harness, Apache License 2.0) to the ROBOTIS OMX-F.

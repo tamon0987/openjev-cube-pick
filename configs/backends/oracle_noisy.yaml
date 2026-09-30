@@ -1,0 +1,5 @@
+# Oracle with 15% label noise - exercises confidence gating / escalation paths.
+kind: oracle
+name: oracle_noisy
+noise: 0.15
+confidence: 0.7

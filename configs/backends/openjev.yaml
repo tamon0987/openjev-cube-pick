@@ -1,0 +1,14 @@
+# openjev: self-hosted, Jev wire-compatible, DiffusionGemma-26B-A4B NVFP4 (>=24 GB GPU).
+# README says images are accepted (up to 8, ~280 input tokens each). The exact
+# field name can be checked with `dlb smoke --backend openjev`; default "images".
+kind: jev_http
+name: openjev
+base_url: http://127.0.0.1:8080
+endpoint: /v1/systemone
+api_key_env: OPENJEV_API_KEY      # optional
+model: openjev-latest     # API-facing name; "dgemma" is only vLLM's internal served name
+send_model_field: true
+image_policy: send
+image_field: images
+timeout_s: 60
+price_per_m_input_tokens_usd: 0.0

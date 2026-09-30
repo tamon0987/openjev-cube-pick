@@ -1,0 +1,30 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: system deps (headless GL for MuJoCo)
+        run: sudo apt-get update && sudo apt-get install -y libosmesa6 libgl1 libegl1
+      - run: pip install -e ".[dev]"
+      - run: ruff check . && ruff format --check .
+      - run: MUJOCO_GL=osmesa pytest -q
+      - name: end-to-end with local backends
+        run: |
+          export MUJOCO_GL=osmesa
+          dlb gen --out data/ci --episodes 3 --image-size 96
+          dlb offline --backend oracle --modality text --dataset data/ci --out results/offline
+          python -m dlb.backends.mock_server --port 8099 & sleep 1
+          dlb offline --backend djev --base-url http://127.0.0.1:8099 --modality image --dataset data/ci --out results/offline
+          dlb online --backend oracle_noisy --episodes 2 --gate 0.5 --on-low oracle --out results/online
+          dlb report --results results --out results/report.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-report
+          path: results/report.md

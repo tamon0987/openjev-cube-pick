@@ -1,0 +1,66 @@
+<mujoco model="omx pick-place scene">
+  <!--
+    ROBOTIS OMX (OMX-F follower) on a table with a red cube and a blue bin.
+    The robot model is the official MJCF from ROBOTIS-GIT/robotis_mujoco_menagerie
+    (Apache-2.0); see omx.xml for the few additions marked DLB.
+  -->
+  <include file="omx.xml"/>
+
+  <option timestep="0.002" integrator="implicitfast" gravity="0 0 -9.81" cone="elliptic" impratio="10"/>
+
+  <visual>
+    <headlight diffuse="0.7 0.7 0.7" ambient="0.35 0.35 0.35" specular="0.1 0.1 0.1"/>
+    <global offwidth="640" offheight="640"/>
+    <quality shadowsize="2048"/>
+  </visual>
+
+  <asset>
+    <texture type="2d" name="table" builtin="checker" rgb1="0.80 0.78 0.72" rgb2="0.62 0.60 0.55" width="256" height="256"/>
+    <material name="table" texture="table" texrepeat="6 6" texuniform="true" reflectance="0.05"/>
+    <material name="cube" rgba="0.9 0.15 0.15 1"/>
+    <material name="binmat" rgba="0.2 0.35 0.85 1"/>
+  </asset>
+
+  <default>
+    <default class="bin">
+      <geom type="box" material="binmat" contype="1" conaffinity="1" condim="4" friction="1 0.005 0.0001"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light pos="0.3 0.2 1.2" dir="-0.2 -0.1 -1" directional="true" diffuse="0.8 0.8 0.8"/>
+    <light pos="-0.3 -0.4 1.0" dir="0.3 0.4 -1" directional="false" diffuse="0.4 0.4 0.4"/>
+    <geom name="table" type="plane" size="0.7 0.7 0.02" material="table" condim="4" friction="1 0.005 0.0001"/>
+
+    <!-- external cameras -->
+    <camera name="front" pos="0.62 -0.50 0.42" xyaxes="0.62 0.78 0 -0.4 0.32 0.86" fovy="42"/>
+    <camera name="top" pos="0.20 0.0 0.60" xyaxes="0 -1 0 1 0 0" fovy="55"/>
+
+    <body name="cube" pos="0.20 0.05 0.015">
+      <freejoint name="cube_free"/>
+      <geom name="cube_geom" type="box" size="0.015 0.015 0.015" material="cube" mass="0.03"
+            condim="4" friction="1 0.005 0.0001"/>
+    </body>
+
+    <body name="bin" pos="0.20 -0.10 0">
+      <geom class="bin" name="bin_floor" size="0.045 0.045 0.002" pos="0 0 0.002"/>
+      <geom class="bin" size="0.045 0.003 0.02" pos="0 0.042 0.02"/>
+      <geom class="bin" size="0.045 0.003 0.02" pos="0 -0.042 0.02"/>
+      <geom class="bin" size="0.003 0.045 0.02" pos="0.042 0 0.02"/>
+      <geom class="bin" size="0.003 0.045 0.02" pos="-0.042 0 0.02"/>
+      <site name="bin_center" pos="0 0 0.004" size="0.003" rgba="0 0 1 0"/>
+    </body>
+  </worldbody>
+
+  <equality>
+    <!-- Simplified grasp: activated by the env when the jaw closes around the cube. -->
+    <weld name="grasp_weld" body1="link5" body2="cube" active="false" solref="0.005 1"/>
+  </equality>
+
+  <keyframe>
+    <!-- arm: Joint1..5, Gripper, Gripper_mimic ; cube: xyz + quat -->
+    <key name="home"
+         qpos="0 -0.08 0.29 1.36 0 0.8 -0.8   0.20 0.05 0.015 1 0 0 0"
+         ctrl="0 -0.08 0.29 1.36 0 0.8"/>
+  </keyframe>
+</mujoco>

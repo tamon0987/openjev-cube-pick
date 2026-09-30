@@ -1,0 +1,5 @@
+# Ground-truth policy from privileged simulator state. Upper bound + CI backend.
+kind: oracle
+name: oracle
+noise: 0.0
+confidence: 0.95

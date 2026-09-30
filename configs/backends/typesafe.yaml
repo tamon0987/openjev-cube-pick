@@ -1,0 +1,11 @@
+# TypeSafe Jev (hosted). State JSON only - images are dropped.
+kind: jev_http
+name: typesafe
+base_url: https://api.typesafe.ai
+endpoint: /v1/systemone
+api_key_env: TYPESAFE_API_KEY
+model: jev-latest          # or jev-preview
+send_model_field: true
+image_policy: drop
+timeout_s: 30
+price_per_m_input_tokens_usd: 0.042   # output is unmetered (Sep 2026 pricing)

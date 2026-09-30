@@ -1,0 +1,14 @@
+# djev: self-hosted, native image input, endpoint /v1/request.
+# BF16 needs ~52 GB; on the 24 GB laptop we point djev at our own vLLM running the
+# NVFP4 checkpoint. Not verified on a 24 GB GPU; the real-robot harness uses openjev.
+kind: jev_http
+name: djev
+base_url: http://127.0.0.1:8000
+endpoint: /v1/request
+api_key_env: DJEV_API_KEY         # optional (DJEV_API_KEY on the server side)
+model: null
+send_model_field: false
+image_policy: send
+image_field: images
+timeout_s: 60
+price_per_m_input_tokens_usd: 0.0

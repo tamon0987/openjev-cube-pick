@@ -1,0 +1,12 @@
+# Same server as openjev.yaml but images dropped -> isolates the value of vision
+# from the value of the model (compare openjev vs openjev_text vs typesafe).
+kind: jev_http
+name: openjev_text
+base_url: http://127.0.0.1:8080
+endpoint: /v1/systemone
+api_key_env: OPENJEV_API_KEY
+model: dgemma
+send_model_field: true
+image_policy: drop
+timeout_s: 60
+price_per_m_input_tokens_usd: 0.0
