@@ -12,7 +12,7 @@ arecord（既定のマイク）─▶ Silero VAD（発話の区切り）─▶ �
 | 発話の例 | タスク列 |
 |---|---|
 | 赤いキューブをビンに入れて | pick red cube → place bin |
-| それをその場に置いて青いキューブをビンに入れて | place here → pick blue cube → place bin |
+| それをその場に置いて青いキューブをビンに入れて（何か持っているとき） | place here → pick blue cube → place bin |
 | 赤いキューブを青いキューブの上に置いて | pick red cube → place on:blue cube |
 | 止まって | （空。キューを消す） |
 
@@ -42,18 +42,19 @@ bash scripts/stt_server.sh stop
 ## 3. 動作確認（ロボットなし）
 
 ```bash
-uv run python -m dlb.voice.listen                    # マイク → 文字起こしを表示
-uv run python -m dlb.voice.listen --intent           # 文字起こしに加えてタスク列も表示
-uv run python -m dlb.voice.console                   # キーボードで指示を打ってタスク列を確認
-uv run python -m dlb.voice.agent --dry-run --text    # エージェントの解釈だけ（ロボットは動かない）
+python -m dlb.voice.listen                    # マイク → 文字起こしを表示
+python -m dlb.voice.listen --intent           # 文字起こしに加えてタスク列も表示
+python -m dlb.voice.console                   # キーボードで指示を打ってタスク列を確認
+python -m dlb.voice.agent --dry-run --text    # エージェントの解釈だけ（ロボットは動かない）
 ```
 
 ## 4. ロボットを音声で動かす
 
-セットアップが済んでいれば、毎回の起動は次の 3 つです。どのターミナルでも、先に `source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash` をしておきます。
+セットアップが済んでいれば、毎回の起動は次の 3 つです。どのターミナルでも、先に `source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash` をしておきます。ターミナル 3 ではさらに `source .venv/bin/activate` もします。
 
 ```bash
 # ターミナル 1: フォロワーアームのドライバ（real_robot.md の 3.）
+export ROS_DOMAIN_ID=42
 ros2 launch open_manipulator_bringup omx_f_follower_ai.launch.py port_name:=/dev/ttyACM0
 
 # ターミナル 2: openjev と文字起こしサーバー（一度 serve_openjev.sh / stt_server.sh で作ったコンテナを起動）
@@ -61,9 +62,11 @@ docker start openjev stt
 curl -s localhost:8080/health; curl -s localhost:8010/health   # 両方とも応答が返れば準備完了
 
 # ターミナル 3: 音声エージェント（リポジトリのディレクトリで）
-uv run python -m dlb.voice.agent --objects "orange cube,blue cube" --bin-name "black bin"
-uv run python -m dlb.voice.agent --text              # 音声の代わりにキーボードで指示する
+python -m dlb.voice.agent --objects "orange cube,blue cube" --bin-name "black bin"
+python -m dlb.voice.agent --text              # 音声の代わりにキーボードで指示する
 ```
+
+カメラを付け替えたり挿し直したりしたときは、先に `python scripts/setup_cameras.py`（[real_robot.md](real_robot.md) の 5.1）をやり直します。
 
 `ROS_DOMAIN_ID` はドライバ側とエージェント側でそろえます（`configs/robot/omx_f.yaml` の `ros_domain_id`、既定 42）。`~/.bashrc` に `export ROS_DOMAIN_ID=42` を書いておくと楽です。openjev は起動直後の数分 `/health` が返らないことがあるので、返るまで待ってからエージェントを起動してください。
 

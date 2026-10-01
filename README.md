@@ -17,9 +17,9 @@ The decision layer never receives object coordinates. Motion is planned by solvi
 | Robot | OMX-F (follower arm) from the ROBOTIS OMX-AI kit, with a U2D2 |
 | Cameras | Two USB cameras: a wrist camera fixed to the gripper, and an overhead camera looking straight down at the table |
 | Microphone | Any device usable as the OS default input |
-| Objects | 3 cm cubes and a bin (box) |
+| Objects | 3 cm cubes and a bin (box) with a rim about 4 cm high; the code assumes both sizes (`CUBE_EDGE`, `BIN_RIM_Z` in `dlb/harness/twotier.py`) |
 | PC | Ubuntu 24.04, NVIDIA GPU with 24 GB+ VRAM (for openjev), 64 GB RAM recommended, 30 GB+ free disk, Docker + NVIDIA Container Toolkit |
-| Software | ROS 2 Jazzy, [uv](https://docs.astral.sh/uv/) |
+| Software | ROS 2 Jazzy, `python3-venv` |
 | API key | OpenAI (instruction parsing and overhead image marking; billed per run) |
 
 Tested on an RTX PRO 5000 Blackwell (Laptop, 24 GB). GPU driver and Docker setup notes are in [docs/setup_laptop.md](docs/setup_laptop.md).
@@ -34,24 +34,27 @@ The overall flow is below. See the linked documents for the details of each step
    ```bash
    git clone https://github.com/tamon0987/openjev-cube-pick.git && cd openjev-cube-pick
    source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash
-   uv venv --system-site-packages -p /usr/bin/python3
-   uv pip install -e ".[real,voice,dev]"
+   /usr/bin/python3 -m venv --system-site-packages .venv
+   source .venv/bin/activate
+   pip install -e ".[real,voice,dev]"
    cp .env.example .env   # fill in OPENAI_API_KEY
    ```
 
+   Every later command runs in a shell where these three `source` lines have been run (ROS 2, the workspace, then `.venv`).
+
 3. **Bring up the arm and check it** (`scripts/real_check.py`)
 4. **Record the begin pose and the table height for your rig** (`scripts/real_poses.py`)
-5. **Set the camera device numbers and calibrate the wrist camera** (`scripts/calibrate_wrist_model.py`)
+5. **Register the cameras and calibrate the wrist camera** (`scripts/setup_cameras.py`, again whenever the cameras are re-attached; `scripts/calibrate_wrist_model.py`)
 6. **Start the decision layer (openjev)** ([docs/openjev.md](docs/openjev.md); the first start downloads ~19 GB of weights and builds GPU kernels, which takes 20–30 minutes)
 7. **Try a grasp only** (`scripts/real_grasp_only.py`)
 8. **Start the speech-to-text server and instruct the robot by voice** ([docs/voice.md](docs/voice.md))
 
    ```bash
    bash scripts/stt_server.sh
-   uv run python -m dlb.voice.agent --objects "orange cube,blue cube" --bin-name "black bin"
+   python -m dlb.voice.agent --objects "orange cube,blue cube" --bin-name "black bin"
    ```
 
-Steps 3–7 are detailed in [docs/real_robot.md](docs/real_robot.md) (step 6 in [docs/openjev.md](docs/openjev.md)). The poses, gripper values and wrist camera calibration in `configs/robot/` belong to the author's rig. They will not work as is, so redo steps 4–5 on your own setup.
+Steps 3–7 are detailed in [docs/real_robot.md](docs/real_robot.md) (step 6 in [docs/openjev.md](docs/openjev.md)). The poses, gripper values and wrist camera calibration in `configs/robot/` come from the author's rig. Steps 3–5 check whether they fit yours (`scripts/calibrate_wrist_model.py --check` for the wrist camera) and say how to redo the ones that do not.
 
 ## ⚠️ Safety
 
@@ -73,7 +76,7 @@ This code moves a real robot arm.
 | `dlb/backends/`, `dlb/contract.py` | Communication with the decision layer (TypeSafe Jev wire format). Supports openjev, the TypeSafe API and djev |
 | `configs/robot/` | Real robot settings (ROS topics, poses, speed limits, cameras) and the wrist camera calibration |
 | `configs/backends/` | Decision layer endpoints |
-| `scripts/` | Starting openjev and the speech-to-text server; checking, pose recording and calibration of the real robot |
+| `scripts/` | Starting openjev and the speech-to-text server; checking, pose recording, camera registration and calibration of the real robot |
 | `docs/` | Guides for the real robot, openjev and voice; the decision layer wire format (`decision_contract.md`); GPU laptop setup |
 
 `dlb/eval/` and `dlb gen / offline / online / report` are a benchmark for comparing decision layers on the same samples. They are not needed to run the robot.

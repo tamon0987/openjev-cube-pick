@@ -82,7 +82,7 @@ class RealOMX(PickPlaceEnv):
 
         os.environ.setdefault("ROS_DOMAIN_ID", str(self.cfg.get("ros_domain_id", 0)))
         import rclpy
-        from rclpy.executors import SingleThreadedExecutor
+        from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
         from sensor_msgs.msg import JointState
         from trajectory_msgs.msg import JointTrajectory
 
@@ -107,7 +107,14 @@ class RealOMX(PickPlaceEnv):
         self._node.create_subscription(JointState, self.cfg["joint_states_topic"], on_js, 20)
         self._exec = SingleThreadedExecutor()
         self._exec.add_node(self._node)
-        self._spin = threading.Thread(target=self._exec.spin, daemon=True)
+
+        def spin() -> None:
+            try:
+                self._exec.spin()
+            except ExternalShutdownException:  # Ctrl+C: rclpy's signal handler shut the context down first
+                pass
+
+        self._spin = threading.Thread(target=spin, daemon=True)
         self._spin.start()
         t0 = time.monotonic()
         while self._q_meas is None:
@@ -118,8 +125,21 @@ class RealOMX(PickPlaceEnv):
             time.sleep(0.05)
 
     def close(self) -> None:
+        import rclpy
+
+        # stop the camera readers and the spin thread before teardown; exiting with them alive aborts the
+        # process (core dump)
+        if hasattr(self, "_cam_stop"):
+            self._cam_stop.set()
+            for t in self._cam_threads:
+                t.join(timeout=2.0)
+            for cap in self._caps.values():
+                cap.release()
         self._exec.shutdown()
+        self._spin.join(timeout=2.0)
         self._node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
     def measured(self) -> tuple[np.ndarray, float | None]:
         with self._lock:
@@ -322,6 +342,8 @@ class RealOMX(PickPlaceEnv):
         # ``on_begin()`` runs as soon as the arm rests at the begin pose (the overhead guide takes its first image
         # then and marks it in the background): right away when it is there already, else after the move.
         obs = super().reset(seed)
+        if self.camera_mode != "twin":
+            self._park_virtual_objects()
         if self.cfg.get("poses", {}).get("begin"):
             self._sync_twin(settle=0.0)  # the twin's arm to where the robot is (super().reset put it at home)
             early = on_begin is not None and self.at_pose("begin")
@@ -343,6 +365,20 @@ class RealOMX(PickPlaceEnv):
         self.open_gripper()
         self.step_count = 0
         return obs
+
+    def _park_virtual_objects(self) -> None:
+        """Move the twin's virtual cube and bin out of the workspace (real cameras: they stand for nothing).
+
+        The twin's fingers collide with them, and the jaw state comes from the twin's finger aperture: a descent
+        onto a real cube where the virtual bin happened to stand squeezed the virtual fingers, read as
+        "closed_empty", and the grasp was given up before the real gripper ever closed.
+        """
+        import mujoco
+
+        self.model.body_pos[self.bin_body] = [-1.0, 0.0, 0.0]
+        self.data.qpos[self.cube_qadr : self.cube_qadr + 3] = [-1.0, 0.3, 0.015]
+        self.data.qvel[self.cube_dadr : self.cube_dadr + 6] = 0.0
+        mujoco.mj_forward(self.model, self.data)
 
     # ------------------------------------------------------------------ #
     # torque off for posing by hand (begin / rest poses, z floor)
@@ -381,26 +417,42 @@ class RealOMX(PickPlaceEnv):
     def _start_cameras(self) -> None:
         import cv2
 
+        rotations = {
+            0: None,
+            90: cv2.ROTATE_90_CLOCKWISE,
+            180: cv2.ROTATE_180,
+            270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+        }
+
         self._frames: dict[str, np.ndarray] = {}
         self._caps = {}
+        self._cam_stop = threading.Event()
+        self._cam_threads: list[threading.Thread] = []
         for name, c in self.cfg["cameras"].items():
-            cap = cv2.VideoCapture(int(c["device"]), cv2.CAP_V4L2)
+            dev = c["device"]  # N of /dev/videoN, or a stable path such as /dev/v4l/by-id/...
+            cap = cv2.VideoCapture(dev if isinstance(dev, str) else int(dev), cv2.CAP_V4L2)
             # MJPG: two uncompressed 640x480 streams do not fit through the shared USB hub
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not cap.isOpened():
-                raise RuntimeError(f"camera {name} (/dev/video{c['device']}) did not open")
+                raise RuntimeError(f"camera {name} ({dev}) did not open")
             self._caps[name] = cap
 
-            def reader(name: str = name, cap: Any = cap) -> None:
-                while True:
+            # the overhead image must show the robot at the bottom (marking.py); a camera mounted the other way
+            # round is turned by `rotate` (degrees clockwise, set by scripts/setup_cameras.py)
+            rot = rotations[int(c.get("rotate", 0))]
+
+            def reader(name: str = name, cap: Any = cap, rot: int | None = rot) -> None:
+                while not self._cam_stop.is_set():
                     ok, f = cap.read()
                     if ok:
-                        self._frames[name] = f
+                        self._frames[name] = f if rot is None else cv2.rotate(f, rot)
 
-            threading.Thread(target=reader, daemon=True).start()
+            t = threading.Thread(target=reader, daemon=True)
+            t.start()
+            self._cam_threads.append(t)
         t0 = time.monotonic()
         while len(self._frames) < len(self._caps):
             if time.monotonic() - t0 > 5:
@@ -409,8 +461,9 @@ class RealOMX(PickPlaceEnv):
         time.sleep(1.5)  # let auto exposure settle
         calib = Path(self.cfg["cameras"]["wrist"]["calibration"])
         self.wrist_calib = yaml.safe_load(calib.read_text()) if calib.exists() else None
-        top = Path(self.cfg["cameras"]["front"]["calibration"])
-        self.top_calib = yaml.safe_load(top.read_text()) if top.exists() else None
+        # optional affine table->pixel fit of the overhead camera (older setups); the overhead guide needs none
+        top = self.cfg["cameras"].get("front", {}).get("calibration")
+        self.top_calib = yaml.safe_load(Path(top).read_text()) if top and Path(top).exists() else None
         # the "front" device now looks straight down from above (Show-Harness-style scene camera)
         # a calibration marked stale (the camera was moved) is ignored; the overhead guide needs none
         self.top_view = bool(

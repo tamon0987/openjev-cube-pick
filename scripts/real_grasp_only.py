@@ -1,6 +1,6 @@
-"""Real robot: run only reach -> align -> descend_grasp with the Jev servo, then stop holding the cube.
+"""Real robot: run only reach -> align -> descend_grasp with the Jev bisect servo, then stop holding the cube.
 
-uv run python scripts/real_grasp_only.py --object-names "orange cube,black bin"
+python scripts/real_grasp_only.py --object-names "orange cube,black bin"
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ import argparse
 
 from dlb.backends import build_backend
 from dlb.harness import twotier
-from dlb.harness.twotier import TASK_ORDER, JevServoPolicy, Plan, SequencePlanner, TwoTierRunner
+from dlb.harness.twotier import TASK_ORDER, JevBisectServoPolicy, Plan, SequencePlanner, TwoTierRunner
 
 
 class GraspOnly(SequencePlanner):
@@ -32,7 +32,9 @@ def main() -> None:
     from dlb.real.omx import RealOMX
 
     env = RealOMX("configs/robot/omx_f.yaml", camera_source="usb", cameras=("front", "wrist"), image_size=320)
-    policy = JevServoPolicy(build_backend("openjev"), cameras=("wrist",))
+    policy = JevBisectServoPolicy(
+        build_backend("openjev"), cameras=("wrist",)
+    )  # as in dlb twotier --policy bisect
     runner = TwoTierRunner(
         env,
         GraspOnly(),

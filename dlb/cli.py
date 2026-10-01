@@ -269,15 +269,19 @@ def cmd_twotier(args: argparse.Namespace) -> int:
         guide=guide,
     )
     results = []
-    for i in range(args.episodes):
-        r = runner.run(i, seed=args.seed + i)
-        results.append(r)
-        print(
-            f"ep {i:3d} seed={r.seed} success={r.success} decisions={r.decisions} planner={r.planner_calls} "
-            f"esc={r.escalations} miss={r.missed_grasps} pre={r.pre_moves} acc={r.command_accuracy:.2f} {r.stop_reason} "
-            f"{r.subtasks}",
-            flush=True,
-        )
+    try:
+        for i in range(args.episodes):
+            r = runner.run(i, seed=args.seed + i)
+            results.append(r)
+            print(
+                f"ep {i:3d} seed={r.seed} success={r.success} decisions={r.decisions} planner={r.planner_calls} "
+                f"esc={r.escalations} miss={r.missed_grasps} pre={r.pre_moves} acc={r.command_accuracy:.2f} "
+                f"{r.stop_reason} {r.subtasks}",
+                flush=True,
+            )
+    finally:
+        if hasattr(env, "close"):  # the real robot's ROS and camera threads (the simulator has none)
+            env.close()
     s = summarize_twotier(results)
     s["run"] = run
     Path(args.out).mkdir(parents=True, exist_ok=True)

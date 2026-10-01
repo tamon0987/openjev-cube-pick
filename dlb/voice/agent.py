@@ -1,8 +1,8 @@
 """Voice (or typed) instructions to the real robot: listen, parse into tasks, run them, wait for the next one.
 
-    uv run python -m dlb.voice.agent                      # microphone (the STT server must be up: scripts/stt_server.sh)
-    uv run python -m dlb.voice.agent --text               # type instructions instead
-    uv run python -m dlb.voice.agent --dry-run --text     # parse only, no robot
+    python -m dlb.voice.agent                      # microphone (the STT server must be up: scripts/stt_server.sh)
+    python -m dlb.voice.agent --text               # type instructions instead
+    python -m dlb.voice.agent --dry-run --text     # parse only, no robot
 
 While idle at the begin pose the overhead view of every known object is marked in the background, so a new
 instruction starts from marks that are at most a few seconds old instead of waiting ~8 s for one. Interrupting a

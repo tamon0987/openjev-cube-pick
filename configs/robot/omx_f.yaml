@@ -15,7 +15,7 @@ gripper_closed: 0.0
 gripper_held_margin: 0.08
 
 # Tool pitch below horizontal for every IK solve: "begin" keeps the begin pose's pitch (as Show-Harness does), or
-# a number of degrees (90 = straight down). The wrist calibration is only valid for the pitch it was taken at.
+# a number of degrees (90 = straight down). The wrist camera model (calib_wrist.yaml) holds at any pitch.
 tool_pitch_deg: begin
 
 # Saved joint poses (rad, URDF convention), captured by hand with scripts/real_poses.py --capture <name>.
@@ -47,8 +47,14 @@ max_goal_error: 0.08       # rad: a move that rests further than this from its g
 arrive_timeout_extra: 3.0  # s beyond the planned duration before the move counts as failed
 max_joint_step: 0.6        # rad, refuse IK solutions that jump further than this in one move
 
-# USB cameras: device = N of /dev/videoN (v4l2-ctl --list-devices). wrist: on the gripper, calibrated by
-# scripts/calibrate_wrist_model.py. front: the overhead camera; the VLM marks its image, no calibration needed.
+# USB cameras: device is written by scripts/setup_cameras.py (run it after (re)attaching the cameras) as a stable
+# /dev/v4l/by-id/ path; N of /dev/videoN also works, but the numbers can swap after a replug or reboot.
+# wrist: on the gripper, calibrated by scripts/calibrate_wrist_model.py. front: the overhead camera; the VLM marks
+# its image, no calibration needed.
 cameras:
-  wrist: {device: 2, calibration: configs/robot/calib_wrist.yaml}
-  front: {device: 4, calibration: configs/robot/calib_front.yaml}
+  wrist:
+    device: /dev/v4l/by-id/usb-Innomaker_Innomaker-U20CAM-720P_SN0001-video-index0
+    calibration: configs/robot/calib_wrist.yaml
+  front:
+    device: /dev/v4l/by-id/usb-SunplusIT_Inc_j5_WebCam_JVU430_01.00.00-video-index0
+    rotate: 180  # degrees clockwise so that the robot is at the bottom of the overhead image
