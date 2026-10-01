@@ -26,7 +26,8 @@ Operations:
   "here" (put it down right where the gripper is now, e.g. その場に / ここに / 下ろして), or "on:<name>" (stack it on top of that object).
 
 Rules:
-- Use only the object names listed below. Map Japanese names to them (赤いキューブ -> "red cube", ビン/箱/ゴミ箱 -> the bin).
+- Use only the object names listed below ("bin" is the container things are put into). Map the user's words to them
+  by meaning, kind, colour or sound: the words are usually Japanese and name things loosely (ビン/箱/ゴミ箱 -> the bin).
 - それ / これ / 持っているもの refers to the object in the gripper.
 - The gripper holds at most one object. If a task needs the gripper but it is (or will be) holding something, first place
   that object as the user said; if the user did not say where, place it "here".
@@ -35,8 +36,8 @@ Rules:
   replace_queue = false only when the user adds work for afterwards (それが終わったら, 次に, あとで); the tasks then start
   from the state after the current queue.
 - Stop / cancel (止まって, やめて, ストップ): tasks = [], replace_queue = true.
-- The instruction comes from speech recognition and may be misheard: 瓶 / ビン / びん = bin, チューブ = キューブ (cube);
-  map a colour to the known object of that colour (オレンジ = orange, 赤 = red, 青 = blue).
+- The instruction comes from speech recognition and may be misheard (瓶 / びん / 水 for ビン, a similar-sounding word for
+  an object's name): pick the listed object that the user most likely meant.
 - If the instruction is ambiguous (e.g. an object that is not listed, or two objects match), give tasks = [] and a short
   Japanese question in "clarify". Otherwise clarify = null.
 
@@ -51,7 +52,7 @@ Instruction: 「{utterance}」"""
 @dataclass
 class RobotState:
     held: str | None = None
-    objects: list[str] = field(default_factory=lambda: ["red cube", "blue cube", "bin"])
+    objects: list[str] = field(default_factory=lambda: ["bin"])  # what is on the table, plus the bin
     queue: list[dict[str, Any]] = field(default_factory=list)
 
     def places(self) -> list[str]:
