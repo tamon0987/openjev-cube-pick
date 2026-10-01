@@ -178,6 +178,63 @@ class OverheadMarker:
         )
         return json.loads(text)
 
+    def list_objects(self, img: np.ndarray) -> tuple[list[str], str | None]:
+        """The loose objects on the table and the container to put things into, named by the vision model (one call).
+
+        Used when no object names are given: the names then come from what is on the table, not from a fixed list.
+        """
+        from dlb.contract import image_to_data_url
+
+        prompt = (
+            "This is a top-down camera view of a table. A small robot arm stands at the bottom centre of the image.\n"
+            'List in "objects" the loose objects on the table that the arm could pick up, and give in "container" the '
+            "container that things can be put into (null if there is none). Leave out the robot itself, its cables, "
+            "the cameras and their stands, and the walls. Name each one in 2-4 English words that tell it apart from "
+            "the others (its colour and what it is)."
+        )
+        schema = {
+            "type": "object",
+            "properties": {
+                "objects": {"type": "array", "items": {"type": "string"}},
+                "container": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            },
+            "required": ["objects", "container"],
+            "additionalProperties": False,
+        }
+        body: dict[str, Any] = {
+            "model": self.model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {
+                            "type": "input_image",
+                            "image_url": image_to_data_url(img, fmt="JPEG"),
+                            "detail": "high",
+                        },
+                    ],
+                }
+            ],
+            "text": {"format": {"type": "json_schema", "name": "objects", "schema": schema, "strict": True}},
+        }
+        if self.effort:
+            body["reasoning"] = {"effort": self.effort}
+        r = self.client.post("/responses", json=body)
+        if r.status_code != 200:
+            raise RuntimeError(f"{self.model}: {r.status_code} {r.text[:300]}")
+        text = "".join(
+            c.get("text", "")
+            for o in r.json().get("output", [])
+            if o.get("type") == "message"
+            for c in o.get("content", [])
+            if c.get("type") == "output_text"
+        )
+        out = json.loads(text)
+        names = [n.strip().lower() for n in out["objects"] if n.strip()]
+        container = (out["container"] or "").strip().lower() or None
+        return [n for n in dict.fromkeys(names) if n != container], container
+
     def mark(self, img: np.ndarray) -> Marks:
         from dlb.contract import image_to_data_url
 

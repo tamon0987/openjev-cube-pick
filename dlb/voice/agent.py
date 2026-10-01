@@ -53,7 +53,8 @@ def _speech(args: argparse.Namespace, out: queue.Queue) -> None:
 class Agent:
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        self.objects = [o.strip() for o in args.objects.split(",") if o.strip()]
+        # with no --objects the names come from the overhead image when the robot starts (start_robot)
+        self.objects = [o.strip() for o in (args.objects or "").split(",") if o.strip()]
         self.state = RobotState(None, [*self.objects, "bin"], [])
         self.parser = IntentParser(args.intent_model, args.effort or None)
         self.env = self.runner = self.guide = None
@@ -70,14 +71,16 @@ class Agent:
         from dlb.harness.twotier import JevBisectServoPolicy, TaskPlanner, TwoTierRunner
         from dlb.real.omx import RealOMX
 
+        self.env = RealOMX(
+            self.args.robot_config, camera_source="usb", cameras=("front", "wrist"), image_size=320
+        )
+        if not self.objects or not self.args.bin_name:
+            self.discover()
         marker = OverheadMarker(
             model=self.args.mark_model, n=self.args.mark_n, object_names=(*self.objects, self.args.bin_name)
         )
         self.guide = OverheadGuide(
             marker, log_dir=self.log / "marks", roles={"cube": self.objects[0], "bin": self.args.bin_name}
-        )
-        self.env = RealOMX(
-            self.args.robot_config, camera_source="usb", cameras=("front", "wrist"), image_size=320
         )
         policy = JevBisectServoPolicy(build_backend("openjev"), cameras=("wrist",))
         self.runner = TwoTierRunner(
@@ -90,6 +93,23 @@ class Agent:
         )
         self.env.reset(seed=0)  # begin pose, gripper open
         self.idle_mark()
+
+    def discover(self) -> None:
+        """Name the objects on the table and the container from the overhead image (the ones not given)."""
+        from dlb.harness.marking import OverheadMarker
+
+        objects, container = OverheadMarker(model=self.args.mark_model).list_objects(
+            self.env.overhead_frame()
+        )
+        self.objects = self.objects or objects
+        self.args.bin_name = self.args.bin_name or container
+        print(
+            f"  on the table: {', '.join(self.objects) or '-'}; container: {self.args.bin_name or '-'}",
+            flush=True,
+        )
+        if not self.objects or not self.args.bin_name:
+            raise SystemExit("no objects or no container found on the table: pass --objects / --bin-name")
+        self.state = RobotState(self.state.held, [*self.objects, "bin"], [])
 
     def idle_mark(self) -> None:
         """Mark everything now (background) so the next instruction starts from fresh marks."""
@@ -207,8 +227,16 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m dlb.voice.agent", description=__doc__.split("\n")[0])
     ap.add_argument("--text", action="store_true", help="type instructions instead of speaking")
     ap.add_argument("--dry-run", action="store_true", help="parse only; no robot")
-    ap.add_argument("--objects", default="red cube,blue cube", help="objects to pick/stack (comma-separated)")
-    ap.add_argument("--bin-name", default="black bin", help="how the bin looks (for the overhead marks)")
+    ap.add_argument(
+        "--objects",
+        default="",
+        help="objects to pick/stack (comma-separated); default: found in the overhead image",
+    )
+    ap.add_argument(
+        "--bin-name",
+        default="",
+        help="how the bin looks (for the overhead marks); default: found in the image",
+    )
     ap.add_argument("--robot-config", default="configs/robot/omx_f.yaml")
     ap.add_argument("--device", default="default", help="ALSA capture device")
     ap.add_argument("--stt-url", default="http://127.0.0.1:8010/v1/")

@@ -10,6 +10,8 @@ from dlb.voice.console import Session
 from dlb.voice.intent import Intent, IntentParser, RobotState, apply, check_sequence, schema
 from dlb.voice.listen import SR, Segmenter, Transcriber, file_frames, listen
 
+OBJS = ["red cube", "blue cube", "bin"]  # example table (the state lists what is on the table)
+
 
 def _responses_client(answer: dict, seen: list) -> httpx.Client:
     def handler(req: httpx.Request) -> httpx.Response:
@@ -38,7 +40,7 @@ def test_parse_builds_request_and_normalizes():
         "replace_queue": True,
         "clarify": None,
     }
-    state = RobotState(held="red cube", queue=[{"op": "place", "where": "bin"}])
+    state = RobotState(held="red cube", queue=[{"op": "place", "where": "bin"}], objects=OBJS)
     intent = IntentParser(client=_responses_client(answer, seen)).parse(
         "それをその場に置いて青いキューブをビンに入れて", state
     )
@@ -60,7 +62,7 @@ def test_parse_builds_request_and_normalizes():
 
 
 def test_parse_rejects_unknown_names_and_http_errors():
-    state = RobotState()
+    state = RobotState(objects=OBJS)
     bad = {
         "tasks": [{"op": "pick", "object": "green cube", "where": None}],
         "replace_queue": True,
@@ -88,7 +90,7 @@ def test_schema_is_strict_everywhere():
 
 
 def test_check_sequence_and_apply():
-    state = RobotState(held="red cube", queue=[{"op": "place", "where": "bin"}])
+    state = RobotState(held="red cube", queue=[{"op": "place", "where": "bin"}], objects=OBJS)
     grab = Intent([{"op": "pick", "object": "blue cube"}], replace_queue=True)
     assert check_sequence(grab, state) == ["task 0: pick blue cube while holding red cube"]
     after = Intent([{"op": "pick", "object": "blue cube"}, {"op": "place", "where": "on:red cube"}], False)
@@ -134,7 +136,7 @@ def test_session_updates_queue_and_handles_commands(capsys):
     parser = IntentParser(
         client=httpx.Client(base_url="https://x/v1", transport=httpx.MockTransport(handler))
     )
-    session = Session(parser, RobotState(held="red cube"))
+    session = Session(parser, RobotState(held="red cube", objects=OBJS))
     session.run(["それを置いて", "", ":hold", "それから青いキューブをビンに入れて", ":queue"])
     assert session.state.held is None
     assert [t["op"] for t in session.state.queue] == ["place", "pick", "place"]
