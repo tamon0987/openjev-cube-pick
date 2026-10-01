@@ -47,3 +47,5 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# a ROS 2-sourced shell adds launch_testing / launch_ros plugins, whose hooks fail on pytest 9
+addopts = "-p no:launch_testing -p no:launch_ros"

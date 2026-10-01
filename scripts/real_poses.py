@@ -1,10 +1,10 @@
 """Saved poses and the table height for the real OMX-F, captured by hand (as in Show-Harness's go_begin.py).
 
-    uv run python scripts/real_poses.py --list               # saved poses with fingertip position and pitch
-    uv run python scripts/real_poses.py --go begin           # slow joint move to a saved pose
-    uv run python scripts/real_poses.py --capture begin      # torque off, pose the arm by hand, Enter -> saved
-    uv run python scripts/real_poses.py --capture rest
-    uv run python scripts/real_poses.py --z-floor            # torque off, rest the FINGERTIPS on the table, Enter -> saved
+    python scripts/real_poses.py --list               # saved poses with fingertip position and pitch
+    python scripts/real_poses.py --go begin           # slow joint move to a saved pose
+    python scripts/real_poses.py --capture begin      # torque off, pose the arm by hand, Enter -> saved
+    python scripts/real_poses.py --capture rest
+    python scripts/real_poses.py --z-floor            # torque off, rest the FINGERTIPS on the table, Enter -> saved
 
 A begin pose should hold the gripper pitched down over the workspace with joint-limit headroom (>= 8 deg);
 the script prints the margins. Values go into configs/robot/omx_f.yaml.

@@ -8,7 +8,7 @@ layer; the cube's colour is used only to measure):
   stored in the link5 frame so they follow the wrist as the base turns.
 
 Procedure (the robot's follower launch must be running):
-    uv run python scripts/calibrate_wrist.py
+    python scripts/calibrate_wrist.py
 1. the arm moves to the begin pose (the pitch the IK keeps afterwards); place the cube directly below the gripper, centred between the
    fingertips, then press Enter,
 2. the arm rises and lowers a little (cube stays), then moves 2 cm along world x and y and back.

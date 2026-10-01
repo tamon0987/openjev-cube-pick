@@ -1,6 +1,6 @@
 """Live check of the instruction parser (gpt-5.5) on the examples in docs/voice.md. Three API calls.
 
-uv run python scripts/voice_intent_check.py [--effort low] [--env-file .env]
+python scripts/voice_intent_check.py [--effort low] [--env-file .env]
 """
 
 from __future__ import annotations

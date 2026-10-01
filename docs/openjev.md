@@ -31,8 +31,8 @@ docker logs -f openjev                 # 起動の進み具合を見る
 
 ```bash
 curl -s http://127.0.0.1:8080/health       # 200 が返れば起動完了
-uv run dlb health --backend openjev
-uv run dlb smoke  --backend openjev        # テキスト 3 問 + 画像 1 枚。画像の問いで p(red square) が 1 に近ければ OK
+dlb health --backend openjev
+dlb smoke  --backend openjev        # テキスト 3 問 + 画像 1 枚。画像の問いで p(red square) が 1 に近ければ OK
 ```
 
 ## 止める・再起動する

@@ -6,10 +6,11 @@ or without hardware:
     ros2 launch open_manipulator_bringup omx_f_follower_ai.launch.py use_mock_hardware:=true
 
 Then, with ~/ros2_ws/install/setup.bash sourced:
-    uv run python scripts/real_check.py            # read only: joint angles, twin tcp, gripper reading
-    uv run python scripts/real_check.py --home     # + slow move to the tool-down home pose
-    uv run python scripts/real_check.py --jog      # + 1 cm moves in each direction and back
-    uv run python scripts/real_check.py --gripper  # + open / close, prints readings for configs/robot/omx_f.yaml
+    python scripts/real_check.py            # read only: joint angles, twin tcp, gripper reading
+    python scripts/real_check.py --home     # + slow move to the tool-down home pose
+    python scripts/real_check.py --jog      # + 1 cm moves in each direction and back
+    python scripts/real_check.py --gripper  # + open / close, prints readings for configs/robot/omx_f.yaml
+    python scripts/real_check.py --held     # + close on a cube held between the fingers -> gripper_held_margin
 
 Every motion asks for Enter first. Ctrl+C stops; the arm holds its last target.
 """
@@ -36,6 +37,7 @@ def main() -> None:
     ap.add_argument("--home", action="store_true")
     ap.add_argument("--jog", action="store_true")
     ap.add_argument("--gripper", action="store_true")
+    ap.add_argument("--held", action="store_true", help="close on a cube held between the fingers")
     ap.add_argument("--step-cm", type=float, default=1.0)
     ap.add_argument("--yes", action="store_true", help="do not ask before each motion (mock only)")
     a = ap.parse_args()
@@ -53,7 +55,7 @@ def main() -> None:
         "  URDF end_effector_link should read 2.0 cm lower in z (check with: ros2 run tf2_ros tf2_echo link0 end_effector_link)",
     )
 
-    if a.home or a.jog or a.gripper:
+    if a.home or a.jog or a.gripper or a.held:
         home = env.home_ctrl[env.arm_act]
         confirm(
             f"move slowly to home joints {np.round(home, 2).tolist()} (tool down, ~8 cm above the table)",
@@ -83,9 +85,29 @@ def main() -> None:
             g = env.measured()[1]
             print("   gripper reading:", None if g is None else round(g, 3))
         print(
-            "Put these readings into configs/robot/omx_f.yaml (gripper_open / gripper_closed). Then close on the"
-            " cube by hand and note the reading: gripper_held_margin should sit between it and gripper_closed."
+            "Put these readings into configs/robot/omx_f.yaml (gripper_open / gripper_closed), then run --held."
         )
+
+    if a.held:
+        cfg = env.cfg
+        confirm("gripper open", a.yes)
+        env.open_gripper()
+        confirm(
+            "hold a cube between the open fingers (keep your fingers clear of the jaws), then close", a.yes
+        )
+        env.close_gripper()
+        g = env.measured()[1]
+        print("   gripper reading on the cube:", None if g is None else round(g, 3))
+        confirm("gripper open (take the cube)", a.yes)
+        env.open_gripper()
+        if g is not None:
+            # `held` needs the reading to clear both gripper_closed and gripper_open by the margin
+            gap = min(abs(g - cfg["gripper_closed"]), abs(cfg["gripper_open"] - g))
+            print(
+                f"Set gripper_held_margin in configs/robot/omx_f.yaml to about {round(gap / 2, 3)}"
+                f" (now {cfg['gripper_held_margin']}): half the distance from the held reading to the nearer of"
+                " gripper_closed / gripper_open."
+            )
     env.close()
 
 

@@ -33,14 +33,13 @@ sudo usermod -aG docker $USER   # 再ログイン
 ## 4. Python / MuJoCo
 
 ```bash
-sudo apt install libegl1 libgl1 libosmesa6
-curl -LsSf https://astral.sh/uv/install.sh | sh   # uv が未導入なら
+sudo apt install libegl1 libgl1 libosmesa6 python3-venv
 ```
 
 Python の仮想環境は、ROS 2 の `rclpy` を使うため [real_robot.md](real_robot.md) の 2. の手順で作る。作ったあと、描画を確認する:
 
 ```bash
-MUJOCO_GL=egl uv run python -c "import mujoco; print(mujoco.__version__)"
+MUJOCO_GL=egl python -c "import mujoco; print(mujoco.__version__)"
 ```
 
 `MUJOCO_GL=egl` で `EGLError` が出る場合は `libnvidia-egl-*` が入っているか、`__EGL_VENDOR_LIBRARY_FILENAMES` が NVIDIA を指しているかを確認。ダメなら `MUJOCO_GL=osmesa`（CPU 描画、遅い）で進めて後で直す。

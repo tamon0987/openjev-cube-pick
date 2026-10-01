@@ -1,4 +1,5 @@
 square_size: 320
+ee_pixel: [189.0, 268.0]  # closed fingertips in the wrist image (read off an image, 2026-09-28)
 cross_px_by_drop:
 - - 0.0413
   - 177.4

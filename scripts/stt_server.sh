@@ -6,8 +6,8 @@
 #   bash scripts/stt_server.sh cuda       # GPU, when nvidia-smi shows >= ~1.5 GB free (int8_float16)
 #   bash scripts/stt_server.sh stop
 #
-# Then: uv run python -m dlb.voice.listen    (mic -> transcripts)
-#       uv run python -m dlb.voice.listen --file x.wav
+# Then: python -m dlb.voice.listen    (mic -> transcripts)
+#       python -m dlb.voice.listen --file x.wav
 set -euo pipefail
 MODE="${1:-cpu}"
 NAME="${STT_NAME:-stt}"
