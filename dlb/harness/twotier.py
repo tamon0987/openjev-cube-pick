@@ -30,7 +30,6 @@ import numpy as np
 
 from dlb.backends.base import DecisionBackend
 from dlb.contract import Choice, DecisionRequest, Noul, image_to_data_url
-from dlb.harness.marking import is_cube
 from dlb.sim.env import OPEN_MIN, TASK_TEXT, Z_GRASP, Z_HOVER, Z_TRAVEL, PickPlaceEnv
 
 # Object names used in every prompt. The texts below say "red cube" / "blue bin" (the simulator's objects);
@@ -1626,8 +1625,14 @@ class TwoTierRunner:
         t0 = time.perf_counter()
         env.precise = False  # travel moves: no sag correction needed
         try:
-            if float(env.tcp_pos[2]) < Z_TRAVEL - 0.005:
-                env._move_tcp(np.array([*env.tcp_pos[:2], Z_TRAVEL]))  # clear of the bin and the cube first
+            # Straight up, level to above the begin pose, then the joint move. A joint move from a release over the
+            # bin swept low and caught the bin's rim and the object just dropped in it.
+            here = env.tcp_pos.copy()
+            if here[2] < TRANSPORT_Z - 0.005:
+                env._move_tcp(np.array([*here[:2], TRANSPORT_Z]))
+            above = getattr(env, "pose_tcp", {}).get("begin")
+            if above is not None and np.linalg.norm(above[:2] - here[:2]) > 0.03:
+                env._move_tcp(np.array([*above[:2], max(TRANSPORT_Z, float(above[2]))]))
             env.go_pose("begin")
         except Exception as e:  # noqa: BLE001 - the episode's result stands; the robot stops where it is
             print("  return to the begin pose failed:", e, flush=True)
@@ -1655,7 +1660,7 @@ class TwoTierRunner:
         t0 = time.perf_counter()
         self.env.precise = False  # travel: the wrist servo or the release corrects afterwards
         try:
-            r = self.guide.goto(self.env, target, z)
+            r = self.guide.goto(self.env, target, z, travel_z=TRANSPORT_Z if target == "bin" else None)
         finally:
             self.env.precise = True
         res.planner_latency_s.append(time.perf_counter() - t0)
@@ -1695,7 +1700,7 @@ class TwoTierRunner:
                     return "escalated"
                 self.guide.set_targets(place=name)
                 env.precise = False
-                r = self.guide.goto(env, "bin", RELEASE_Z)
+                r = self.guide.goto(env, "bin", RELEASE_Z, travel_z=TRANSPORT_Z)
                 env.precise = True
                 write(
                     {
@@ -1729,8 +1734,9 @@ class TwoTierRunner:
 
     @property
     def guide_bin_name(self) -> str:
-        names = tuple(getattr(getattr(self.guide, "marker", None), "names", ()) or ())
-        return next((n for n in names if not is_cube(n)), "bin")
+        # the bin the guide was set up with; the first non-cube name was wrong once other objects were listed
+        # (a carrot listed before the bin was taken for the bin)
+        return getattr(self.guide, "bin_name", "bin")
 
     def _recover(self) -> None:
         self.env.open_gripper()

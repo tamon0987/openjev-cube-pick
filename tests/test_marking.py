@@ -4,8 +4,15 @@ import time
 import numpy as np
 
 from dlb.harness.marking import Marks, OverheadGuide, TableMap, summarize
-from dlb.harness.twotier import OVERHEAD_ORDER, OraclePolicy, SequencePlanner, TwoTierResult, TwoTierRunner
-from dlb.sim.env import Z_TRAVEL, PickPlaceEnv
+from dlb.harness.twotier import (
+    OVERHEAD_ORDER,
+    TRANSPORT_Z,
+    OraclePolicy,
+    SequencePlanner,
+    TwoTierResult,
+    TwoTierRunner,
+)
+from dlb.sim.env import PickPlaceEnv
 
 
 def _camera(xy: np.ndarray, s: float = 660.0, rot_deg: float = 8.0, c=(350.0, 400.0)) -> np.ndarray:
@@ -266,7 +273,7 @@ class _StopEnv:
         self.held, self.tcp_pos, self.calls = held, np.array([0.17, -0.09, z]), []
 
     def _move_tcp(self, target):
-        self.calls.append(("move", float(target[2])))
+        self.calls.append(("move", *np.round(target, 3).tolist()))
         self.tcp_pos = np.array(target, float)
 
     def go_pose(self, name):
@@ -283,7 +290,16 @@ def test_finish_returns_to_begin_unless_holding_after_a_failure():
 
     env = _StopEnv(held=False)
     assert finish(env, "planner_complete") == "begin"
-    assert env.calls == [("move", Z_TRAVEL), ("pose", "begin")]  # up to travel height first
+    assert env.calls == [("move", 0.17, -0.09, TRANSPORT_Z), ("pose", "begin")]  # straight up first
+    # with the begin pose's tcp known: straight up, level to above it, then the joint move
+    env = _StopEnv(held=False)
+    env.pose_tcp = {"begin": np.array([0.19, 0.0, 0.09])}
+    assert finish(env, "planner_complete") == "begin"
+    assert env.calls == [
+        ("move", 0.17, -0.09, TRANSPORT_Z),
+        ("move", 0.19, 0.0, TRANSPORT_Z),
+        ("pose", "begin"),
+    ]
     env = _StopEnv(held=False)
     assert finish(env, "max_decisions") == "begin" and env.calls[-1] == ("pose", "begin")
     env = _StopEnv(held=True)

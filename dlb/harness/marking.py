@@ -357,6 +357,7 @@ class OverheadGuide:
             roles
             or ({"cube": names[0], "bin": names[1]} if len(names) >= 2 else {"cube": "cube", "bin": "bin"})
         )
+        self.bin_name = self.roles["bin"]  # where "bin" places go (roles["bin"] changes when stacking)
         self.seen: dict[str, np.ndarray] = {}  # latest mark of every object name
         self._static: dict[str, list[np.ndarray]] = {}  # marks of objects the robot does not move (averaged)
         self.tol, self.max_step, self.bounds = tol_m, max_step_m, bounds
@@ -522,7 +523,9 @@ class OverheadGuide:
         self._k += 1
         im.save(self.log_dir / f"mark_{self._k:03d}.jpg", quality=85)
 
-    def goto(self, env: Any, target: str, z: float) -> GotoResult:
+    def goto(self, env: Any, target: str, z: float, travel_z: float | None = None) -> GotoResult:
+        """Move above ``target`` by its overhead mark and end at height ``z``. With ``travel_z`` (carrying an
+        object) the arm rises straight up to that height first, travels level, and only then goes to ``z``."""
         rec: dict[str, Any] = {"tcp": np.round(env.tcp_pos, 4).tolist()}
         shot = None
         if target == "cube":
@@ -632,7 +635,14 @@ class OverheadGuide:
             self.cube_mark = px.copy()
         cur_z = float(env.tcp_pos[2])
         if err > self.tol or abs(cur_z - z) > 0.01:
-            if cur_z < z - 0.01 and err > 0.03:
+            if travel_z is not None and err > 0.03:
+                # a held object hangs below the fingers: a diagonal climb from the grasp dragged a carrot over
+                # the table, so climb first, then travel level
+                top = max(travel_z, z)
+                if cur_z < top - 0.01:
+                    env._move_tcp(np.array([*here, top]))
+                env._move_tcp(np.array([*dest, top]))
+            elif cur_z < z - 0.01 and err > 0.03:
                 env._move_tcp(np.array([*here, min(z, cur_z + 0.05)]))  # rise clear of the table first
             env._move_tcp(np.array([*dest, z]))
         if target == "cube":

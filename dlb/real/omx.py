@@ -52,6 +52,7 @@ class RealOMX(PickPlaceEnv):
         # The trajectory controller replaces the running trajectory with every new message, so each command
         # carries both the arm and the gripper target.
         self._grip_target: float = float(self.cfg["gripper_open"])
+        self.pose_tcp: dict[str, np.ndarray] = {}  # tcp (table frame) measured at each saved pose reached
         self._grip_meas: float | None = None
         self._stamp = 0.0
         self._lock = threading.Lock()
@@ -330,6 +331,9 @@ class RealOMX(PickPlaceEnv):
         self._wait_arm(q_goal, t)
         self._sync_twin()
         self._tcp_cmd = None
+        self.pose_tcp[name] = (
+            self.tcp_pos.copy()
+        )  # where the tcp rests in this pose (return moves aim above it)
 
     def at_pose(self, name: str, tol: float = 0.03) -> bool:
         """Whether the measured joints are within ``tol`` rad of a saved pose."""
