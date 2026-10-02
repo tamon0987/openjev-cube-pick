@@ -92,6 +92,11 @@ class Agent:
             guide=self.guide,
         )
         self.env.reset(seed=0)  # begin pose, gripper open
+        # the overhead map's scale, measured with the arm itself (~30 s; nothing is kept between sessions)
+        print(
+            "  calibrating the overhead view (the arm visits a few poses around the begin pose)", flush=True
+        )
+        self.guide.calibrate(self.env)
         self.idle_mark()
 
     def discover(self) -> None:
@@ -133,7 +138,8 @@ class Agent:
 
     @staticmethod
     def _changed(a, b, level: int = 30, pixels: int = 12) -> bool:
-        # a 3 cm cube covers ~25 px of the 160x120 view; camera noise and light flicker stay under ``level``
+        # an object of ~3 cm covers ~25 px of the 160x120 view; camera noise and light flicker stay under
+        # ``level`` (a smaller object that is moved is picked up by the periodic re-mark, --remark-s)
         return a is not None and b is not None and int((abs(a - b) > level).sum()) >= pixels
 
     def refresh_if_stale(self) -> None:
@@ -197,7 +203,12 @@ class Agent:
 
     def run(self) -> int:
         if not self.args.dry_run:
-            self.start_robot()
+            try:
+                self.start_robot()
+            except BaseException:
+                if self.env is not None:
+                    self.env.close()
+                raise
         heard: queue.Queue = queue.Queue()
         threading.Thread(target=_speech, args=(self.args, heard), daemon=True).start()
         try:
