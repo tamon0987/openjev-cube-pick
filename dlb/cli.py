@@ -254,7 +254,7 @@ def cmd_twotier(args: argparse.Namespace) -> int:
             names = tuple(x.strip() for x in args.object_names.split(","))
         elif hasattr(env, "overhead_frame"):
             # no names given: the first loose object and the container found in the overhead image
-            objects, container = marker.list_objects(env.overhead_frame())
+            objects, container = marker.list_objects(env.overhead_frame(), flat=args.flat_place)
             if not objects or not container:
                 raise SystemExit("no object or no container found on the table: pass --object-names")
             names = (objects[0], container)
@@ -263,7 +263,9 @@ def cmd_twotier(args: argparse.Namespace) -> int:
         else:
             raise SystemExit("--overhead-guide needs --object-names (or a robot with an overhead camera)")
         marker.names = names
-        guide = OverheadGuide(marker, log_dir=Path(args.out) / "logs" / run / "marks")
+        guide = OverheadGuide(
+            marker, log_dir=Path(args.out) / "logs" / run / "marks", container=not args.flat_place
+        )
     runner = TwoTierRunner(
         env,
         planner,
@@ -379,6 +381,11 @@ def main(argv: list[str] | None = None) -> int:
         "--overhead-guide",
         action="store_true",
         help="sequence planner: coarse moves to the cube and the bin by VLM marks in the overhead image",
+    )
+    p.add_argument(
+        "--flat-place",
+        action="store_true",
+        help="overhead guide: the place (second of --object-names) is a flat mark on the table, not a container",
     )
     p.add_argument("--mark-model", default="gpt-5.5", help="vision model that marks the overhead image")
     p.add_argument("--mark-n", type=int, default=5, help="parallel marking queries (median)")

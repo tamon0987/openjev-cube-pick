@@ -178,17 +178,23 @@ class OverheadMarker:
         )
         return json.loads(text)
 
-    def list_objects(self, img: np.ndarray) -> tuple[list[str], str | None]:
+    def list_objects(self, img: np.ndarray, flat: bool = False) -> tuple[list[str], str | None]:
         """The loose objects on the table and the container to put things into, named by the vision model (one call).
 
         Used when no object names are given: the names then come from what is on the table, not from a fixed list.
+        ``flat``: the place is a flat mark on the table (e.g. a cross of tape), not a container.
         """
         from dlb.contract import image_to_data_url
 
+        place = (
+            "flat mark on the table that things are to be put on, such as a cross of tape"
+            if flat
+            else "container that things can be put into"
+        )
         prompt = (
             "This is a top-down camera view of a table. A small robot arm stands at the bottom centre of the image.\n"
             'List in "objects" the loose objects on the table that the arm could pick up, and give in "container" the '
-            "container that things can be put into (null if there is none). Leave out the robot itself, its cables, "
+            f"{place} (null if there is none). Leave out the robot itself, its cables, "
             "the cameras and their stands, and the walls. Name each one in 2-4 English words that tell it apart from "
             "the others (its colour and what it is)."
         )
@@ -545,8 +551,12 @@ class OverheadGuide:
         bounds: tuple[tuple[float, float], tuple[float, float]] = ((0.10, 0.30), (-0.20, 0.20)),
         log_dir: str | Path | None = None,
         roles: dict[str, str] | None = None,
+        container: bool = True,
     ):
         self.marker, self.map = marker, table_map or TableMap()
+        # the place ("bin") is a container with a rim; False: a flat mark on the table (objects on it can be picked
+        # again, and the held object is set down on it instead of dropped)
+        self.container = container
         # role -> object name: "cube" is the object to pick, "bin" the place to put it (the bin, or another object
         # to stack on). Marks are keyed by object name; with the defaults the names are the roles themselves.
         names = tuple(getattr(marker, "names", ()) or ())
@@ -935,7 +945,8 @@ class OverheadGuide:
                 c, name = self._pt(fresh, "cube"), self.bin_name
                 b = fresh.boxes.get(name)
                 if (
-                    b is not None
+                    self.container
+                    and b is not None
                     and name != self.roles["cube"]
                     and b[0] <= c[0] <= b[2]
                     and b[1] <= c[1] <= b[3]

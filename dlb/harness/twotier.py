@@ -1673,6 +1673,10 @@ class TwoTierRunner:
             r = self.guide.goto(self.env, target, z, travel_z=TRANSPORT_Z if target == "bin" else None)
         finally:
             self.env.precise = True
+        if r.ok and target == "bin" and self.env.held and not getattr(self.guide, "container", True):
+            # a flat mark, not a container: lower the held object to the table before the release
+            dz = Z_GRASP + PLACE_Z_MARGIN - float(self.env.tcp_pos[2])
+            self.env.move_relative(np.array([0.0, 0.0, dz]), from_measured=True)
         res.planner_latency_s.append(time.perf_counter() - t0)
         write(
             {
@@ -1728,7 +1732,12 @@ class TwoTierRunner:
                     event(sub, "escalated", f"overhead guide: {r.reason}", 1)
                     res.escalations += 1
                     return "escalated"
-                z = None if where == "bin" else Z_GRASP + CUBE_EDGE + PLACE_Z_MARGIN
+                if (
+                    where == "bin"
+                ):  # a container: dropped in from RELEASE_Z; a flat mark: set down on the table
+                    z = None if getattr(self.guide, "container", True) else Z_GRASP + PLACE_Z_MARGIN
+                else:
+                    z = Z_GRASP + CUBE_EDGE + PLACE_Z_MARGIN
             if z is not None:
                 env.precise = True  # set it down gently at the right height
                 env.move_relative(np.array([0.0, 0.0, z - float(env.tcp_pos[2])]), from_measured=True)
