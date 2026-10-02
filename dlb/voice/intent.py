@@ -54,6 +54,7 @@ class RobotState:
     held: str | None = None
     objects: list[str] = field(default_factory=lambda: ["bin"])  # what is on the table, plus the bin
     queue: list[dict[str, Any]] = field(default_factory=list)
+    place_name: str = ""  # what "bin" is on this table when it is not a bin (e.g. "red cross mark")
 
     def places(self) -> list[str]:
         return [*PLACES, *(f"on:{o}" for o in self.objects if o != "bin")]
@@ -153,12 +154,18 @@ class IntentParser:
         self.client = client
 
     def prompt(self, utterance: str, state: RobotState) -> str:
-        return PROMPT.format(
+        text = PROMPT.format(
             held=json.dumps(state.held),
             objects=json.dumps(state.objects),
             queue=json.dumps(state.queue, ensure_ascii=False),
             utterance=utterance,
         )
+        if state.place_name:  # the place is not a bin: say what the user will call it
+            note = (
+                f'- on this table "bin" is the {state.place_name}: putting something there is where = "bin"\n'
+            )
+            text = text.replace("- current task queue:", note + "- current task queue:")
+        return text
 
     def parse(self, utterance: str, state: RobotState) -> Intent:
         body: dict[str, Any] = {
@@ -192,6 +199,6 @@ def apply(intent: Intent, state: RobotState) -> RobotState:
     """The state with the queue rebuilt (``replace_queue``) or extended; ``held`` is left to the runner.
     A clarifying question changes nothing."""
     if intent.clarify:
-        return RobotState(state.held, list(state.objects), [dict(t) for t in state.queue])
+        return RobotState(state.held, list(state.objects), [dict(t) for t in state.queue], state.place_name)
     queue = intent.tasks if intent.replace_queue else [*state.queue, *intent.tasks]
-    return RobotState(state.held, list(state.objects), [dict(t) for t in queue])
+    return RobotState(state.held, list(state.objects), [dict(t) for t in queue], state.place_name)

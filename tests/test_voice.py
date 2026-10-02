@@ -61,6 +61,13 @@ def test_parse_builds_request_and_normalizes():
     assert check_sequence(intent, state) == []
 
 
+def test_prompt_names_a_place_that_is_not_a_bin():
+    p = IntentParser(client=_responses_client({}, []))
+    assert "on this table" not in p.prompt("x", RobotState(objects=OBJS))  # a bin: the prompt as it was
+    text = p.prompt("x", RobotState(objects=OBJS, place_name="red cross mark"))
+    assert '"bin" is the red cross mark' in text
+
+
 def test_parse_rejects_unknown_names_and_http_errors():
     state = RobotState(objects=OBJS)
     bad = {

@@ -17,7 +17,7 @@ The decision layer never receives object coordinates. Motion is planned by solvi
 | Robot | OMX-F (follower arm) from the ROBOTIS OMX-AI kit, with a U2D2 |
 | Cameras | Two USB cameras: a wrist camera fixed to the gripper, and an overhead camera looking straight down at the table |
 | Microphone | Any device usable as the OS default input |
-| Objects | Small objects the gripper can hold (tested: 3 cm cubes, a plush carrot, a tape roll) and a bin (box) with a rim about 4 cm high. Objects are named in the instruction or found in the overhead image; nothing depends on their names. Grasp and release heights are fixed (`Z_GRASP`, `BIN_RIM_Z` in `dlb/harness/twotier.py`), and stacking assumes objects about 3 cm tall (`CUBE_EDGE`) |
+| Objects | Small objects the gripper can hold (tested: 3 cm cubes, a plush carrot, a tape roll) and a bin (box) with a rim about 4 cm high. Objects are named in the instruction or found in the overhead image; nothing depends on their names. Grasp and release heights are fixed (`Z_GRASP`, `BIN_RIM_Z` in `dlb/harness/twotier.py`), the place can also be a flat mark on the table (`--flat-place`), and stacking assumes objects about 3 cm tall (`CUBE_EDGE`) |
 | PC | Ubuntu 24.04, NVIDIA GPU with 24 GB+ VRAM (for openjev), 64 GB RAM recommended, 30 GB+ free disk, Docker + NVIDIA Container Toolkit |
 | Software | ROS 2 Jazzy, `python3-venv` |
 | API key | OpenAI (instruction parsing and overhead image marking; billed per run) |

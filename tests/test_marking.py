@@ -419,8 +419,58 @@ def test_goto_refuses_an_object_inside_the_bin():
         def overhead_frame(self):
             return np.zeros((480, 640, 3), np.uint8)
 
+        def _move_tcp(self, target):
+            self.tcp_pos = np.array(target, float)
+
     r = g.goto(E(), "cube", 0.12)
     assert not r.ok and "inside the black bin" in r.reason
+    # a flat mark as the place (not a container): an object lying on it can be picked again
+    g = OverheadGuide(M(), TableMap(px_per_m=1150.0), container=False)
+    g.marker.mark = lambda img: m
+    r = g.goto(E(), "cube", 0.12)
+    g.join()
+    assert r.ok and r.reason == "moved"
+
+
+def test_flat_place_sets_the_object_down():
+    from dlb.harness.twotier import PLACE_Z_MARGIN, RELEASE_Z, Z_GRASP, Subtask
+
+    class G:  # a guide that is already above the place
+        bin_name, container = "red cross mark", False
+
+        def set_targets(self, place=None):
+            pass
+
+        def goto(self, env, target, z, travel_z=None):
+            env.tcp_pos = np.array([0.18, 0.11, z])
+            return type("R", (), dict(ok=True, reason="moved", error_cm=0.0, log=[]))()
+
+    class E:
+        held, tcp_pos, calls = True, np.array([0.2, 0.0, 0.03]), []
+
+        def move_relative(self, d, from_measured=False):
+            self.tcp_pos = self.tcp_pos + d
+            self.calls.append(("z", round(float(self.tcp_pos[2]), 4)))
+
+        def open_gripper(self):
+            self.calls.append(("open", round(float(self.tcp_pos[2]), 4)))
+
+    def place(container):
+        env, guide = E(), G()
+        env.calls, guide.container = [], container
+        runner = TwoTierRunner(env, SequencePlanner(overhead=True), OraclePolicy(), guide=guide)
+        sub = Subtask("place_at", "", "", [], place="bin")
+        res = TwoTierResult(0, 0, "p", "s", success=False)
+        assert runner._place(sub, res, lambda *a: None, lambda rec: None) is None
+        return env.calls
+
+    low = round(Z_GRASP + PLACE_Z_MARGIN, 4)
+    assert place(False) == [
+        ("z", low),
+        ("open", low),
+        ("z", round(low + 0.03, 4)),
+    ]  # set down, then clear of it
+    assert place(True) == [("open", RELEASE_Z)]  # a bin: dropped in from the release height
 
 
 def test_pick_target_keeps_its_marked_centre_whatever_it_is_called():

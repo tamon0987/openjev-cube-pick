@@ -55,7 +55,7 @@ class Agent:
         self.args = args
         # with no --objects the names come from the overhead image when the robot starts (start_robot)
         self.objects = [o.strip() for o in (args.objects or "").split(",") if o.strip()]
-        self.state = RobotState(None, [*self.objects, "bin"], [])
+        self.state = RobotState(None, [*self.objects, "bin"], [], args.bin_name if args.flat_place else "")
         self.parser = IntentParser(args.intent_model, args.effort or None)
         self.env = self.runner = self.guide = None
         self.episode = 0
@@ -80,8 +80,13 @@ class Agent:
             model=self.args.mark_model, n=self.args.mark_n, object_names=(*self.objects, self.args.bin_name)
         )
         self.guide = OverheadGuide(
-            marker, log_dir=self.log / "marks", roles={"cube": self.objects[0], "bin": self.args.bin_name}
+            marker,
+            log_dir=self.log / "marks",
+            roles={"cube": self.objects[0], "bin": self.args.bin_name},
+            container=not self.args.flat_place,
         )
+        if self.args.flat_place:
+            self.state.place_name = self.args.bin_name
         policy = JevBisectServoPolicy(build_backend("openjev"), cameras=("wrist",))
         self.runner = TwoTierRunner(
             self.env,
@@ -104,9 +109,9 @@ class Agent:
         from dlb.harness.marking import OverheadMarker
 
         objects, container = OverheadMarker(model=self.args.mark_model).list_objects(
-            self.env.overhead_frame()
+            self.env.overhead_frame(), flat=self.args.flat_place
         )
-        self.objects = self.objects or objects
+        self.objects = self.objects or [o for o in objects if o != self.args.bin_name]
         self.args.bin_name = self.args.bin_name or container
         print(
             f"  on the table: {', '.join(self.objects) or '-'}; container: {self.args.bin_name or '-'}",
@@ -114,7 +119,7 @@ class Agent:
         )
         if not self.objects or not self.args.bin_name:
             raise SystemExit("no objects or no container found on the table: pass --objects / --bin-name")
-        self.state = RobotState(self.state.held, [*self.objects, "bin"], [])
+        self.state = RobotState(self.state.held, [*self.objects, "bin"], [], self.state.place_name)
 
     def idle_mark(self) -> None:
         """Mark everything now (background) so the next instruction starts from fresh marks."""
@@ -193,7 +198,7 @@ class Agent:
         if self.env.held:
             picks = [t["object"] for t in tasks if t["op"] == "pick"]
             held = picks[-1] if picks else self.state.held
-        self.state = RobotState(held, self.state.objects, [])
+        self.state = RobotState(held, self.state.objects, [], self.state.place_name)
         print(
             f"  done in {time.perf_counter() - t0:.1f} s ({r.stop_reason}, decisions {r.decisions}, "
             f"missed grasps {r.missed_grasps}); holding {held}",
@@ -246,7 +251,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--bin-name",
         default="",
-        help="how the bin looks (for the overhead marks); default: found in the image",
+        help="how the bin (or the place mark) looks, for the overhead marks; default: found in the image",
+    )
+    ap.add_argument(
+        "--flat-place",
+        action="store_true",
+        help='the place is a flat mark on the table (e.g. --bin-name "red cross mark"), not a container: objects '
+        "are set down on it, and an object lying on it can be picked again",
     )
     ap.add_argument("--robot-config", default="configs/robot/omx_f.yaml")
     ap.add_argument("--device", default="default", help="ALSA capture device")
