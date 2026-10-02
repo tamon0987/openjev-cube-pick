@@ -5,7 +5,7 @@ Pick up a cube and drop it in a bin with a ROBOTIS OMX-F (the follower arm of th
 ![The OMX-F grasps a cube and drops it in the bin](docs/media/demo.gif)
 
 - **Understanding the instruction**: the speech is transcribed, and gpt-5.5 turns it into a list of pick / place tasks.
-- **Coarse moves**: a VLM (gpt-5.5) marks the objects and the bin in the overhead camera image, and the arm moves above the target. No camera calibration or fiducial markers.
+- **Coarse moves**: a VLM (gpt-5.5) marks the objects and the bin in the overhead camera image, and the arm moves above the target. No camera calibration file or fiducial markers: at start-up the arm visits a few poses around the begin pose (about 30 s), the gripper is marked in each overhead image, and that gives the image scale. Nothing about the objects' size is assumed, and nothing is stored between sessions.
 - **Alignment and grasp**: a green cross is drawn on the wrist camera image where the point directly below the gripper appears. The decision layer ([openjev](https://github.com/razorback16/openjev), a TypeSafe Jev-compatible server running on a local GPU) is asked "is the target left or right of the cross?" and "above or below?". The arm steps toward the target, then descends straight down and grasps.
 
 The decision layer never receives object coordinates. Motion is planned by solving IK on a MuJoCo digital twin, and joint targets are sent through ROS 2.
@@ -17,7 +17,7 @@ The decision layer never receives object coordinates. Motion is planned by solvi
 | Robot | OMX-F (follower arm) from the ROBOTIS OMX-AI kit, with a U2D2 |
 | Cameras | Two USB cameras: a wrist camera fixed to the gripper, and an overhead camera looking straight down at the table |
 | Microphone | Any device usable as the OS default input |
-| Objects | 3 cm cubes and a bin (box) with a rim about 4 cm high; the code assumes both sizes (`CUBE_EDGE`, `BIN_RIM_Z` in `dlb/harness/twotier.py`) |
+| Objects | Small objects the gripper can hold (tested: 3 cm cubes, a plush carrot, a tape roll) and a bin (box) with a rim about 4 cm high. Objects are named in the instruction or found in the overhead image; nothing depends on their names. Grasp and release heights are fixed (`Z_GRASP`, `BIN_RIM_Z` in `dlb/harness/twotier.py`), and stacking assumes objects about 3 cm tall (`CUBE_EDGE`) |
 | PC | Ubuntu 24.04, NVIDIA GPU with 24 GB+ VRAM (for openjev), 64 GB RAM recommended, 30 GB+ free disk, Docker + NVIDIA Container Toolkit |
 | Software | ROS 2 Jazzy, `python3-venv` |
 | API key | OpenAI (instruction parsing and overhead image marking; billed per run) |

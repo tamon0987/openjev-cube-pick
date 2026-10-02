@@ -249,15 +249,21 @@ def cmd_twotier(args: argparse.Namespace) -> int:
     if args.overhead_guide:
         from dlb.harness.marking import OverheadGuide, OverheadMarker
 
-        names = (
-            tuple(x.strip() for x in args.object_names.split(","))
-            if args.object_names
-            else ("orange cube", "black bin")
-        )
-        guide = OverheadGuide(
-            OverheadMarker(model=args.mark_model, n=args.mark_n, object_names=names),
-            log_dir=Path(args.out) / "logs" / run / "marks",
-        )
+        marker = OverheadMarker(model=args.mark_model, n=args.mark_n)
+        if args.object_names:
+            names = tuple(x.strip() for x in args.object_names.split(","))
+        elif hasattr(env, "overhead_frame"):
+            # no names given: the first loose object and the container found in the overhead image
+            objects, container = marker.list_objects(env.overhead_frame())
+            if not objects or not container:
+                raise SystemExit("no object or no container found on the table: pass --object-names")
+            names = (objects[0], container)
+            twotier.set_object_names(*names)
+            print(f"  on the table: {', '.join(objects)}; container: {container}; picking the {names[0]}")
+        else:
+            raise SystemExit("--overhead-guide needs --object-names (or a robot with an overhead camera)")
+        marker.names = names
+        guide = OverheadGuide(marker, log_dir=Path(args.out) / "logs" / run / "marks")
     runner = TwoTierRunner(
         env,
         planner,
@@ -360,7 +366,9 @@ def main(argv: list[str] | None = None) -> int:
         default="scripted",
         help="scripted: simulator truth; sequence: fixed order without truth (real robot); openai: VLM",
     )
-    p.add_argument("--object-names", default=None, help='e.g. "orange cube,black bin" (prompts say red/blue)')
+    p.add_argument(
+        "--object-names", default=None, help='"<object>,<bin>" as they look, e.g. "orange cube,black bin"'
+    )
     p.add_argument(
         "--search-cube", default="", help="sequence planner: wrist-image move while the cube is out of view"
     )

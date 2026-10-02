@@ -33,7 +33,8 @@ from dlb.contract import Choice, DecisionRequest, Noul, image_to_data_url
 from dlb.sim.env import OPEN_MIN, TASK_TEXT, Z_GRASP, Z_HOVER, Z_TRAVEL, PickPlaceEnv
 
 # Object names used in every prompt. The texts below say "red cube" / "blue bin" (the simulator's objects);
-# `_n` swaps in the names set with `set_object_names` (e.g. "orange cube", "black bin" on the real table).
+# `_n` swaps in the names set with `set_object_names` (on the real table: the object named in the instruction or
+# found in the overhead image, e.g. "carrot plush toy", "black bin"). Nothing depends on what the names say.
 OBJ = {"cube": "red cube", "bin": "blue bin"}
 
 
@@ -61,7 +62,9 @@ SUBTASKS = {
 }
 GUIDED = {"goto_cube": "cube", "goto_bin": "bin"}
 # place_at (task lists): carry the held object to a place and let go; executed by the harness
-PLACE_Z_MARGIN = 0.005  # above the surface the held cube is set down on
+PLACE_Z_MARGIN = 0.005  # above the surface the held object is set down on
+# Stacking ("on:<object>") sets the held object down this far above the grasp height: the one remaining size
+# assumption (objects ~3 cm tall, as the cubes). Without it the heights of both objects would be needed.
 CUBE_EDGE = 0.03
 DEFAULT_COMMANDS = {
     "reach_cube": ["MV_FWD", "MV_BACK", "MV_LEFT", "MV_RIGHT", "SUBTASK_DONE", "ESCALATE"],
@@ -1595,7 +1598,10 @@ class TwoTierRunner:
         return res
 
     def _reset_env(self, seed: int) -> None:
-        """Reset the env; with an overhead guide, start the first mark once the arm rests at the begin pose."""
+        """Reset the env; with an overhead guide, start the first mark once the arm rests at the begin pose.
+
+        The first reset also measures the overhead map's scale (``OverheadGuide.calibrate``: the arm visits a few
+        poses around the begin pose and comes back), unless the guide's map was given a scale."""
         env, guide = self.env, self.guide
         if guide is None or not hasattr(env, "overhead_frame"):
             env.reset(seed=seed)
@@ -1607,7 +1613,11 @@ class TwoTierRunner:
             except Exception as e:  # noqa: BLE001 - goto_cube then marks in the foreground
                 print("  could not start the first overhead mark:", e, flush=True)
 
-        if "on_begin" in inspect.signature(env.reset).parameters:
+        if getattr(guide, "needs_calibration", False):
+            env.reset(seed=seed)
+            guide.calibrate(env)  # ends at the begin pose
+            begin_mark()
+        elif "on_begin" in inspect.signature(env.reset).parameters:
             env.reset(seed=seed, on_begin=begin_mark)
         else:
             env.reset(seed=seed)
@@ -1734,8 +1744,8 @@ class TwoTierRunner:
 
     @property
     def guide_bin_name(self) -> str:
-        # the bin the guide was set up with; the first non-cube name was wrong once other objects were listed
-        # (a carrot listed before the bin was taken for the bin)
+        # the bin the guide was set up with (not guessed from the names: a carrot listed before the bin was once
+        # taken for the bin)
         return getattr(self.guide, "bin_name", "bin")
 
     def _recover(self) -> None:

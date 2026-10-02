@@ -1,15 +1,19 @@
 """Calibration-free overhead guidance: a VLM marks the gripper and the objects in the overhead image.
 
-No camera calibration and no markers. The gripper's mark with the tcp from forward kinematics, and the cube's
-mark with the tcp where the cube was later grasped, form table-to-pixel correspondences; ``TableMap`` fits a
-similarity transform to them online. A coarse move to the cube or the bin is then "map the target's mark to
-the table, move there", and the wrist-camera servo (or the release) takes over.
+No camera calibration file and no markers. The gripper's mark with the tcp from forward kinematics, and an
+object's mark with the tcp where the object was later grasped, form table-to-pixel correspondences; ``TableMap``
+fits a similarity transform to them online. A coarse move to the object or the bin is then "map the target's
+mark to the table, move there", and the wrist-camera servo (or the release) takes over.
 
-The map rests on two priors of the setup: the camera looks down with the robot's forward direction towards
-the top of the image, and the cube's apparent size (3 cm edge) gives the scale. Marking takes ~7-9 s (gpt-5.5,
-effort low; effort none misplaced the cube by 70 px). The first mark starts in the background as soon as the
-arm rests at the begin pose (the episode reset calls ``start_background``), so it overlaps the reset; the next
-runs in the background while the wrist servo aligns and grasps.
+The map rests on two priors: the camera looks down with the robot's forward direction towards the top of the
+image, and a scale (pixels per metre). The robot measures the scale itself at start-up
+(``OverheadGuide.calibrate``): the arm visits a few poses around the begin pose, the gripper is marked in each
+overhead image, and a robust fit (``fit_scale``) of the (tcp, pixel) pairs gives the scale and the first pairs
+of the map. Nothing about the objects (name, size) enters, and nothing is stored between sessions.
+
+Marking takes ~7-9 s (gpt-5.5, effort low; effort none misplaced the cube by 70 px). The first mark starts in
+the background as soon as the arm rests at the begin pose (the episode reset calls ``start_background``), so it
+overlaps the reset; the next runs in the background while the wrist servo aligns and grasps.
 """
 
 from __future__ import annotations
@@ -49,6 +53,7 @@ def key_of(name: str) -> str:
 
 
 def prompt_for(objects: tuple[str, ...]) -> str:
+    """The marking prompt; with no objects it asks for the gripper alone (the start-up calibration)."""
     return PROMPT_HEAD + "".join(PROMPT_OBJECT.format(key=key_of(o), name=o) for o in objects) + PROMPT_TAIL
 
 
@@ -56,10 +61,6 @@ def schema_for(objects: tuple[str, ...]) -> dict[str, Any]:
     keys = [key_of(o) for o in objects]
     props = {"gripper": _POINT, **{k: _POINT for k in keys}, **{f"{k}_box": _BOX for k in keys}}
     return {"type": "object", "properties": props, "required": list(props), "additionalProperties": False}
-
-
-def is_cube(name: str) -> bool:
-    return "cube" in name.lower() or "キューブ" in name
 
 
 def load_env_file(path: str | Path = ".env") -> None:
@@ -73,7 +74,6 @@ def load_env_file(path: str | Path = ".env") -> None:
 @dataclass
 class Marks:
     points: dict[str, np.ndarray | None]  # pixel (u, v) in the marked image, or None when not seen
-    cube_size_px: float | None
     spread_px: dict[str, float]
     latency_s: float
     raw: list[dict[str, Any]] = field(default_factory=list)
@@ -91,10 +91,8 @@ def summarize(
 ) -> Marks:
     """Per-coordinate medians of the answers (a majority must see a target; the median ignores the odd one out).
 
-    Points and boxes are keyed by object name (plus "gripper"). A large object's centre (the bin) is the mean of
-    its marked centre and the centre of its bounding box: its box is the steadier of the two when the arm covers
-    part of it. A cube's box includes a visible side face, so its marked centre is kept; the median size of the
-    cubes' boxes is the scale cue.
+    Points and boxes are keyed by object name (plus "gripper"). Every point is the marked centre; the guide
+    steadies the bin's centre with its box (``box_centred``).
     """
     scale = np.array([w / 1000, h / 1000])
     pts, spread, boxes = {}, {}, {}
@@ -108,18 +106,20 @@ def summarize(
     for o in objects:
         B = np.array([r[f"{key_of(o)}_box"] for r in raw if r.get(f"{key_of(o)}_box")], float).reshape(-1, 4)
         boxes[o] = np.median(B, axis=0) * np.r_[scale, scale] if len(B) * 2 > len(raw) else None
-    sizes = [
-        float(np.mean([b[2] - b[0], b[3] - b[1]])) for o, b in boxes.items() if b is not None and is_cube(o)
-    ]
-    size = float(np.median(sizes)) if sizes else None
-    for o, bb in boxes.items():
-        if bb is None or is_cube(o):
-            continue
-        c = np.array([(bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2])
-        # a centre outside its own box is a confused answer: keep the box's centre then
-        inside = pts[o] is not None and bb[0] <= pts[o][0] <= bb[2] and bb[1] <= pts[o][1] <= bb[3]
-        pts[o] = (pts[o] + c) / 2 if inside else c
-    return Marks(pts, size, spread, latency_s, raw, boxes)
+    return Marks(pts, spread, latency_s, raw, boxes)
+
+
+def box_centred(m: Marks, name: str) -> None:
+    """Steady the centre of the container ``name`` (the bin, which the robot does not move) with its bounding box:
+    the mean of the marked centre and the box's centre, the box being the steadier of the two when the arm covers
+    part of it. An object to pick keeps its marked centre (its box includes a visible side face)."""
+    bb = m.boxes.get(name)
+    if bb is None:
+        return
+    c, p = np.array([(bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2]), m.points.get(name)
+    # a centre outside its own box is a confused answer: keep the box's centre then
+    inside = p is not None and bb[0] <= p[0] <= bb[2] and bb[1] <= p[1] <= bb[3]
+    m.points[name] = (p + c) / 2 if inside else c
 
 
 class OverheadMarker:
@@ -130,7 +130,7 @@ class OverheadMarker:
         model: str = "gpt-5.5",
         n: int = 5,
         effort: str | None = "low",
-        object_names: tuple[str, ...] = ("orange cube", "black bin"),
+        object_names: tuple[str, ...] = (),
         timeout_s: float = 120.0,
     ):
         import httpx
@@ -143,14 +143,14 @@ class OverheadMarker:
             headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
         )
 
-    def _ask(self, data_url: str) -> dict[str, Any]:
+    def _ask(self, data_url: str, names: tuple[str, ...]) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self.model,
             "input": [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "input_text", "text": prompt_for(self.names)},
+                        {"type": "input_text", "text": prompt_for(names)},
                         {"type": "input_image", "image_url": data_url, "detail": "high"},
                     ],
                 }
@@ -159,7 +159,7 @@ class OverheadMarker:
                 "format": {
                     "type": "json_schema",
                     "name": "marks",
-                    "schema": schema_for(self.names),
+                    "schema": schema_for(names),
                     "strict": True,
                 }
             },
@@ -235,14 +235,19 @@ class OverheadMarker:
         container = (out["container"] or "").strip().lower() or None
         return [n for n in dict.fromkeys(names) if n != container], container
 
-    def mark(self, img: np.ndarray) -> Marks:
+    def mark_gripper(self, img: np.ndarray) -> Marks:
+        """The gripper alone, with the same ``n`` parallel queries and medians (the start-up calibration)."""
+        return self.mark(img, names=())
+
+    def mark(self, img: np.ndarray, names: tuple[str, ...] | None = None) -> Marks:
         from dlb.contract import image_to_data_url
 
+        names = self.names if names is None else tuple(names)
         h, w = img.shape[:2]
         url = image_to_data_url(img, fmt="JPEG")
         t0 = time.perf_counter()
         with ThreadPoolExecutor(self.n) as ex:
-            futs = [ex.submit(self._ask, url) for _ in range(self.n)]
+            futs = [ex.submit(self._ask, url, names) for _ in range(self.n)]
         raw = []
         for f in futs:
             try:
@@ -251,18 +256,18 @@ class OverheadMarker:
                 print("  marking query failed:", e, flush=True)
         if not raw:
             raise RuntimeError("every marking query failed")
-        return summarize(raw, w, h, time.perf_counter() - t0, self.names)
+        return summarize(raw, w, h, time.perf_counter() - t0, names)
 
 
 class TableMap:
     """Similarity transform table xy (m) -> overhead pixel, fitted to (table xy, pixel) pairs.
 
-    Pairs come from the marked gripper (with the tcp from forward kinematics) and from the grasp (the cube's
+    Pairs come from the marked gripper (with the tcp from forward kinematics) and from the grasp (the object's
     mark and the tcp where it was grasped). Each pair carries a pixel uncertainty: the gripper's mark is poor
-    (the fingertips are 8-12 cm above the table, and the model's point drifts towards a nearby cube: a mark over
-    the cube sat 20 px from where the grasp later found it), the grasp pair is exact up to the cube's mark.
+    (the fingertips are 8-12 cm above the table, and the model's point drifts towards a nearby object: a mark over
+    a cube sat 20 px from where the grasp later found it), the grasp pair is exact up to the object's mark.
 
-    The scale is a weighted least-squares fit with the prior (from the cube's apparent size) as one more
+    The scale is a weighted least-squares fit with the prior (from the start-up calibration) as one more
     observation: ``a = (sum w_i conj(z_i) w_i + s0 / sd0^2) / (sum w_i |z_i|^2 + 1 / sd0^2)``. With pairs a few
     cm apart the prior dominates (three pairs within 9 cm fitted 5.5 px/cm against a true ~6.6 and put the bin
     6 cm too far left); pairs spread over the table take over. The rotation stays at the prior (robot forward =
@@ -352,6 +357,126 @@ class TableMap:
         }
 
 
+# Start-up calibration: what a believable fit of the gripper's marks looks like. Pixel values are for a 640 px
+# wide image and scale with the width.
+CAL_PX_PER_CM = (5.0, 30.0)  # the image shows between ~20 cm and ~1.3 m of table across its width
+CAL_MAX_ROTATION_DEG = 30.0  # from the prior: robot forward = image up, robot left = image left
+CAL_INLIER_PX = 20.0  # a mark further than this from the fit is a wrong mark (gripper marks scatter 10-20 px)
+CAL_MIN_INLIERS = 6  # of the 9 poses (5 let a chance agreement of wrong marks through too often)
+CAL_MIN_SPAN_M = 0.05  # the agreeing poses must spread this far in x and in y
+CAL_MAX_RESIDUAL_PX = 15.0  # rms distance of the agreeing marks to the fit
+
+
+@dataclass
+class ScaleFit:
+    """Result of ``fit_scale``: pixel = a * z + b for z = -y - ix (as ``TableMap.params``)."""
+
+    ok: bool
+    reason: str  # why the fit is not believable ("" when ok)
+    a: complex
+    b: complex
+    inlier: np.ndarray  # per pair: agrees with the fit
+    residual_px: np.ndarray  # per pair: distance of its mark to the fit (nan without a fit)
+
+    @property
+    def px_per_m(self) -> float:
+        return abs(self.a)
+
+    @property
+    def rotation_deg(self) -> float:
+        return float(np.degrees(np.angle(self.a))) if self.a else 0.0
+
+    @property
+    def rms_px(self) -> float:
+        r = self.residual_px[self.inlier]
+        return float(np.sqrt(np.mean(r**2))) if len(r) else float("nan")
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "reason": self.reason,
+            "px_per_cm": round(self.px_per_m / 100, 2),
+            "rotation_deg": round(self.rotation_deg, 1),
+            "inliers": int(self.inlier.sum()),
+            "pairs": len(self.inlier),
+            "rms_px": None if not self.inlier.any() else round(self.rms_px, 1),
+        }
+
+
+def fit_scale(xy: Any, uv: Any, width: int = 640, min_inliers: int = CAL_MIN_INLIERS) -> ScaleFit:
+    """Robust similarity fit of table positions ``xy`` (m) to the gripper's marks ``uv`` (pixels).
+
+    One wrong mark must not set the scale (after a 6 cm sideways step the gripper was once marked 70 px straight
+    "down" the image, which gave 4.4 px/cm instead of ~11), so:
+
+    * every two poses at least 4 cm apart propose a transform; a proposal is dropped unless the pixel displacement
+      points the way the arm moved under the prior (forward = image up, left = image left, within
+      ``CAL_MAX_ROTATION_DEG``) and its scale is plausible (``CAL_PX_PER_CM``);
+    * the proposal that the most marks agree with (within ``CAL_INLIER_PX``) wins, and is refitted by least
+      squares to those marks alone; the others are rejected;
+    * the result counts only when ``min_inliers`` marks and more than half of all agree, they spread in both x
+      and y, the scale and rotation are plausible, and the residual is small.
+    """
+    xy, uv = np.asarray(xy, float).reshape(-1, 2), np.asarray(uv, float).reshape(-1, 2)
+    n, k = len(xy), width / 640.0
+    Z, W = -xy[:, 1] - 1j * xy[:, 0], uv[:, 0] + 1j * uv[:, 1]
+    lo, hi = 100 * CAL_PX_PER_CM[0] * k, 100 * CAL_PX_PER_CM[1] * k
+
+    def plausible(a: complex) -> bool:
+        return lo <= abs(a) <= hi and abs(np.degrees(np.angle(a))) <= CAL_MAX_ROTATION_DEG
+
+    def residuals(a: complex, b: complex) -> np.ndarray:
+        return np.abs(W - a * Z - b)
+
+    best: tuple[tuple[int, float], np.ndarray] | None = None
+    for i in range(n):
+        for j in range(i + 1, n):
+            dz = Z[j] - Z[i]
+            if abs(dz) < 0.04:
+                continue
+            a = (W[j] - W[i]) / dz
+            if not plausible(a):
+                continue
+            r = W - a * Z
+            res = residuals(a, complex(np.median(r.real), np.median(r.imag)))
+            inl = res <= CAL_INLIER_PX * k
+            score = (int(inl.sum()), -float(np.median(res[inl])) if inl.any() else 0.0)
+            if best is None or score > best[0]:
+                best = (score, inl)
+    none = np.zeros(n, bool)
+    if best is None:
+        return ScaleFit(False, "no two marks agree with the arm's moves", 0j, 0j, none, np.full(n, np.nan))
+    inl, a, b = best[1], 0j, 0j
+    for _ in range(5):  # least squares on the agreeing marks; marks that agree with the refit join
+        if inl.sum() < 2:
+            break
+        zm, wm = Z[inl].mean(), W[inl].mean()
+        den = float(np.sum(np.abs(Z[inl] - zm) ** 2))
+        if den < 1e-9:
+            break
+        a = complex(np.sum(np.conj(Z[inl] - zm) * (W[inl] - wm)) / den)
+        b = complex(wm - a * zm)
+        new = residuals(a, b) <= CAL_INLIER_PX * k
+        if (new == inl).all():
+            break
+        inl = new
+    fit = ScaleFit(True, "", a, b, inl, residuals(a, b))
+    span = np.ptp(xy[inl], axis=0) if inl.any() else np.zeros(2)
+    need = max(
+        min_inliers, n // 2 + 1
+    )  # and a majority: a few wrong marks can agree with each other by chance
+    if inl.sum() < need:
+        fit.reason = f"only {int(inl.sum())} of {n} marks agree (need {need})"
+    elif span.min() < CAL_MIN_SPAN_M:
+        fit.reason = f"the agreeing poses span only {span[0] * 100:.0f} x {span[1] * 100:.0f} cm"
+    elif not plausible(a):
+        fit.reason = f"implausible fit: {abs(a) / 100:.1f} px/cm, rotated {fit.rotation_deg:.0f} deg"
+    elif fit.rms_px > CAL_MAX_RESIDUAL_PX * k:
+        fit.reason = f"residual {fit.rms_px:.0f} px"
+    fit.ok = not fit.reason
+    return fit
+
+
 @dataclass
 class GotoResult:
     ok: bool
@@ -373,7 +498,9 @@ class _Shot:
 
 
 class OverheadGuide:
-    """Coarse moves to the marked cube or bin, with as few marks in the critical path as possible.
+    """Coarse moves to the marked object ("cube" role) or bin, with as few marks in the critical path as possible.
+
+    * At start-up ``calibrate`` measures the map's scale with the arm itself (no object's size is assumed).
 
     * The episode reset starts the first mark in the background (``start_background(kind="begin")``) once the
       arm rests at the begin pose; it runs while the reset finishes and the planner starts.
@@ -389,12 +516,25 @@ class OverheadGuide:
     would rarely beat the map. The scale prior and the grasp pair bring the bin within ~3 cm instead.
     """
 
-    CUBE_EDGE_M = 0.03
-    # the cube's box spans its top face and a visible side (7.6 and 8.5 px/cm from the box on the real table,
-    # ~6.6 measured): the box edge is ~1.2 cube edges
-    BOX_PER_EDGE = 1.2
     GRIPPER_SD_PX = 20.0  # pixel uncertainty of a gripper mark (see TableMap)
-    CUBE_SD_PX = 5.0  # pixel uncertainty of the cube's mark (the grasp pair)
+    CUBE_SD_PX = 5.0  # pixel uncertainty of the picked object's mark (the grasp pair)
+    # Start-up calibration: tcp offsets (forward, left; m) from the begin pose, at the begin pose's height. A ring
+    # of ~6-10 cm in every direction (reachable with the begin pitch, inside the workspace clamp), visited in
+    # order round the ring so that the moves are short.
+    CALIB_OFFSETS = (
+        (0.0, 0.0),
+        (0.06, 0.0),
+        (0.05, 0.07),
+        (0.0, 0.10),
+        (-0.04, 0.07),
+        (-0.05, 0.0),
+        (-0.04, -0.07),
+        (0.0, -0.10),
+        (0.05, -0.07),
+    )
+    # added when too few marks agree: between the ring's poses, as far out (poses near the middle say little
+    # about the scale)
+    CALIB_EXTRA = ((0.03, 0.10), (-0.06, 0.04), (-0.06, -0.04), (0.03, -0.10))
 
     def __init__(
         self,
@@ -416,7 +556,7 @@ class OverheadGuide:
         )
         self.bin_name = self.roles["bin"]  # where "bin" places go (roles["bin"] changes when stacking)
         self.seen: dict[str, np.ndarray] = {}  # latest mark of every object name
-        self._static: dict[str, list[np.ndarray]] = {}  # marks of objects the robot does not move (averaged)
+        self._static: dict[str, list[np.ndarray]] = {}  # marks of the bin, which does not move (averaged)
         self.tol, self.max_step, self.bounds = tol_m, max_step_m, bounds
         self.log_dir = Path(log_dir) if log_dir else None
         self._k = 0
@@ -424,7 +564,7 @@ class OverheadGuide:
         self._bg: Future | None = None
         self._bg_kind = ""
         self._t_bg = 0.0
-        self._cube_sizes: list[float] = []
+        self.calibration: dict[str, Any] | None = None  # the start-up calibration's record
         self._bins: list[np.ndarray] = []
         self.shots: list[dict[str, Any]] = []  # every mark of the episode, for the log
         self.last: dict[
@@ -460,12 +600,13 @@ class OverheadGuide:
         return m.points.get(name) if name in m.points else m.points.get(role)
 
     def _use(self, img: np.ndarray | None, tcp: np.ndarray, m: Marks, kind: str = "") -> None:
+        box_centred(m, self.bin_name)
         g, c = m.points.get("gripper"), self._pt(m, "cube")
         for name, p in m.points.items():
             if p is None or name == "gripper":
                 continue
             self.seen[name] = p
-            if not is_cube(name) and name not in ("cube",):
+            if name == self.bin_name:
                 self._static.setdefault(name, []).append(p)
         if g is not None and self._plausible_gripper(tcp, g):
             self.map.add(tcp, g, sd_px=float(np.hypot(self.GRIPPER_SD_PX, m.spread_px.get("gripper", 0.0))))
@@ -474,18 +615,12 @@ class OverheadGuide:
                 f"  gripper mark {np.round(g).tolist()} px is far from where the map puts the tcp: ignored",
                 flush=True,
             )
-        # the cube's box, unless the gripper hides part of it; the median of all boxes seen sets the scale prior
-        if m.cube_size_px and (g is None or c is None or np.linalg.norm(g - c) > 1.5 * m.cube_size_px):
-            self._cube_sizes.append(m.cube_size_px)
-            self.map.prior_scale = float(np.median(self._cube_sizes)) / (self.CUBE_EDGE_M * self.BOX_PER_EDGE)
-        elif self.map.prior_scale is None and m.cube_size_px:
-            self.map.prior_scale = m.cube_size_px / (self.CUBE_EDGE_M * self.BOX_PER_EDGE)
         if c is not None:
             self.last["cube"] = c
         b = self._pt(m, "bin")
         if b is not None:
-            if is_cube(self.roles["bin"]):
-                self.last["bin"] = b  # stacking on a cube: its latest mark
+            if self.roles["bin"] != self.bin_name:
+                self.last["bin"] = b  # stacking on another object: its latest mark
             else:
                 self._bins.append(b)  # the bin does not move: average its marks
                 B = np.array(self._bins)
@@ -498,11 +633,172 @@ class OverheadGuide:
                 "marks": {k: None if v is None else np.round(v, 1).tolist() for k, v in m.points.items()},
                 "spread_px": {k: round(v, 1) for k, v in m.spread_px.items()},
                 "boxes": {k: None if v is None else np.round(v, 1).tolist() for k, v in m.boxes.items()},
-                "cube_size_px": None if m.cube_size_px is None else round(m.cube_size_px, 1),
             }
         )
         if self.log_dir and img is not None:
             self._save(img, m)
+
+    @property
+    def needs_calibration(self) -> bool:
+        """No scale yet: neither given with the map nor measured by ``calibrate``."""
+        return self.map.prior_scale is None
+
+    def calibrate(self, env: Any) -> dict[str, Any]:
+        """Measure the map's scale with the arm itself (start-up; nothing about the objects is assumed).
+
+        From the begin pose (nothing held) the arm visits ``CALIB_OFFSETS`` at the begin pose's height and takes
+        an overhead image at rest in each; every image is marked for the gripper alone (the marker's ``n`` parallel
+        queries and medians) while the arm moves on, and the arm returns to the begin pose. ``fit_scale`` fits the
+        (tcp, mark) pairs and rejects marks that disagree; rejected images are marked once more, and if still too
+        few agree the arm visits ``CALIB_EXTRA``. The fit's scale becomes the map's prior and the agreeing pairs
+        its first pairs. Raises ``RuntimeError`` when no believable fit comes out. Nothing is stored between
+        sessions; the images with the marks drawn and ``calib.jsonl`` go to the log directory.
+
+        The gripper is marked ~9 cm above the table, where things look larger than on the table: on the real rig
+        the gripper-level scale was 11.5-13.5 px/cm against ~10 after grasps. The poses stay at the begin pose's
+        height all the same (lower, the arm could meet objects it knows nothing of yet), the scale enters as a
+        prior with ``TableMap.prior_sd``, and the grasp pairs (table level) refine the map as before.
+        """
+        self.join()
+        t0 = time.perf_counter()
+        home = env.tcp_pos.copy()
+        mark = getattr(self.marker, "mark_gripper", None) or self.marker.mark
+        pool = ThreadPoolExecutor(len(self.CALIB_OFFSETS) + len(self.CALIB_EXTRA))
+        shots: list[dict[str, Any]] = []
+        lo, hi = [b[0] for b in self.bounds], [b[1] for b in self.bounds]
+
+        def visit(offsets: tuple[tuple[float, float], ...]) -> None:
+            precise = getattr(env, "precise", True)
+            env.precise = False  # travel moves: the tcp is read from the joints at rest
+            try:
+                for d in offsets:
+                    dest = np.clip(home[:2] + d, lo, hi)
+                    try:
+                        if np.linalg.norm(dest - env.tcp_pos[:2]) > 1e-3:
+                            env._move_tcp(np.array([*dest, home[2]]))
+                    except Exception as e:  # noqa: BLE001 - an unreachable pose is left out
+                        print(
+                            f"  calibration: pose {np.round(dest * 100, 1).tolist()} cm skipped: {e}",
+                            flush=True,
+                        )
+                        continue
+                    tcp = env.tcp_pos.copy()
+                    if any(np.linalg.norm(tcp[:2] - s["tcp"][:2]) < 0.015 for s in shots):
+                        continue  # stopped short, next to a pose already taken: nothing new
+                    img = env.overhead_frame()
+                    shots.append({"tcp": tcp, "img": img, "job": pool.submit(mark, img), "tries": 1})
+                if hasattr(env, "go_pose"):
+                    env.go_pose("begin")
+                else:
+                    env._move_tcp(home)
+            finally:
+                env.precise = precise
+
+        def fit() -> ScaleFit:
+            for s in shots:
+                if "job" in s:
+                    try:
+                        m = s.pop("job").result()
+                        s["mark"], s["spread"] = m.points.get("gripper"), m.spread_px.get("gripper", 0.0)
+                        s["raw"] = [r.get("gripper") for r in m.raw]  # each query's answer (0-1000)
+                    except Exception as e:  # noqa: BLE001 - one lost mark only costs a pose
+                        print("  calibration: marking failed:", e, flush=True)
+                        s["mark"] = None
+            seen = [s for s in shots if s["mark"] is not None]
+            width = shots[0]["img"].shape[1] if shots else 640
+            f = fit_scale([s["tcp"][:2] for s in seen], [s["mark"] for s in seen], width)
+            for s in shots:
+                s["inlier"], s["residual_px"] = False, None
+            for s, inl, res in zip(seen, f.inlier, f.residual_px, strict=True):
+                s["inlier"], s["residual_px"] = bool(inl), None if np.isnan(res) else round(float(res), 1)
+            return f
+
+        def report(f: ScaleFit, what: str) -> None:
+            bad = [
+                f"pose {i} at {np.round(s['tcp'][:2] * 100, 1).tolist()} cm: "
+                + (
+                    "gripper not marked"
+                    if s["mark"] is None
+                    else f"mark {np.round(s['mark']).astype(int).tolist()} px rejected"
+                    + ("" if s["residual_px"] is None else f", {s['residual_px']:.0f} px from the fit")
+                )
+                for i, s in enumerate(shots)
+                if not s["inlier"]
+            ]
+            print(
+                f"  calibration ({what}): {f.px_per_m / 100:.2f} px/cm, rotation {f.rotation_deg:.1f} deg, "
+                f"{int(f.inlier.sum())} of {len(shots)} poses agree"
+                + (f", residual {f.rms_px:.1f} px" if f.inlier.any() else "")
+                + ("" if f.ok else f" -- not accepted: {f.reason}"),
+                flush=True,
+            )
+            for line in bad:
+                print("    " + line, flush=True)
+
+        try:
+            visit(self.CALIB_OFFSETS)
+            f = fit()
+            report(f, f"{len(shots)} poses")
+            again = [s for s in shots if not s["inlier"]]
+            if not f.ok and again:  # a wrong mark is often a one-off: mark the same images once more
+                for s in again:
+                    s["job"], s["tries"] = pool.submit(mark, s["img"]), s["tries"] + 1
+                f = fit()
+                report(f, f"{len(again)} marked again")
+            if not f.ok:
+                visit(self.CALIB_EXTRA)
+                f = fit()
+                report(f, f"{len(shots)} poses")
+        finally:
+            pool.shutdown(wait=False)
+        rec = {
+            **f.describe(),
+            "seconds": round(time.perf_counter() - t0, 1),
+            "poses": [
+                {
+                    "tcp": np.round(s["tcp"], 4).tolist(),
+                    "mark": None if s["mark"] is None else np.round(s["mark"], 1).tolist(),
+                    "spread_px": round(float(s.get("spread", 0.0)), 1),
+                    "inlier": s["inlier"],
+                    "residual_px": s["residual_px"],
+                    "marked": s["tries"],
+                    "raw_1000": s.get("raw"),
+                }
+                for s in shots
+            ],
+        }
+        self.calibration = rec
+        if self.log_dir:
+            self._save_calibration(shots, rec)
+        if not f.ok:
+            raise RuntimeError(
+                f"overhead calibration failed ({f.reason}): check that the overhead camera sees the gripper "
+                "around the begin pose, with the robot at the bottom of the image (cameras.front.rotate)"
+            )
+        self.map.prior_scale = f.px_per_m
+        for s in shots:
+            if s["inlier"]:
+                self.map.add(s["tcp"], s["mark"], sd_px=float(np.hypot(self.GRIPPER_SD_PX, s["spread"])))
+        print(f"  calibration done in {rec['seconds']:.0f} s: map {self.map.describe()}", flush=True)
+        return rec
+
+    def _save_calibration(self, shots: list[dict[str, Any]], rec: dict[str, Any]) -> None:
+        from PIL import Image, ImageDraw
+
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        for i, s in enumerate(shots):
+            im = Image.fromarray(s["img"])
+            d = ImageDraw.Draw(im)
+            p, c = s["mark"], (0, 255, 0) if s["inlier"] else (255, 0, 0)
+            if p is not None:
+                d.ellipse([p[0] - 6, p[1] - 6, p[0] + 6, p[1] + 6], outline=c, width=2)
+            text = f"pose {i} tcp {np.round(s['tcp'] * 100, 1).tolist()} cm: " + (
+                "not marked" if p is None else "ok" if s["inlier"] else "rejected"
+            )
+            d.text((5, 5), text, fill=c)
+            im.save(self.log_dir / f"calib_{i:02d}.jpg", quality=85)
+        with open(self.log_dir / "calib.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
 
     GRIPPER_OUTLIER_PX = 40.0
 
@@ -636,21 +932,25 @@ class OverheadGuide:
                 )
             if target == "cube":
                 # an object already inside a container (the bin): reaching in would hit its rim
-                c = self._pt(fresh, "cube")
-                for name, b in fresh.boxes.items():
-                    if (
-                        b is not None
-                        and not is_cube(name)
-                        and name != self.roles["cube"]
-                        and b[0] <= c[0] <= b[2]
-                        and b[1] <= c[1] <= b[3]
-                    ):
-                        return GotoResult(
-                            False, None, 1, float("nan"), f"{self.roles['cube']} is inside the {name}", [rec]
-                        )
+                c, name = self._pt(fresh, "cube"), self.bin_name
+                b = fresh.boxes.get(name)
+                if (
+                    b is not None
+                    and name != self.roles["cube"]
+                    and b[0] <= c[0] <= b[2]
+                    and b[1] <= c[1] <= b[3]
+                ):
+                    return GotoResult(
+                        False, None, 1, float("nan"), f"{self.roles['cube']} is inside the {name}", [rec]
+                    )
         if not self.map.ready:
             return GotoResult(
-                False, None, 1, float("nan"), "no table map (gripper or cube size not marked)", [rec]
+                False,
+                None,
+                1,
+                float("nan"),
+                "no table map (no scale: the start-up calibration did not run)",
+                [rec],
             )
         px = self._pt(shot.marks, target) if shot is not None else self.last[target]
         if target == "bin" and "bin" in self.last:

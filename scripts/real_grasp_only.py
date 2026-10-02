@@ -1,4 +1,4 @@
-"""Real robot: run only reach -> align -> descend_grasp with the Jev bisect servo, then stop holding the cube.
+"""Real robot: run only reach -> align -> descend_grasp with the Jev bisect servo, then stop holding the object.
 
 python scripts/real_grasp_only.py --object-names "orange cube,black bin"
 """
@@ -24,7 +24,7 @@ class GraspOnly(SequencePlanner):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--object-names", default="orange cube,black bin")
+    ap.add_argument("--object-names", required=True, help='"<object>,<bin>" as they look')
     ap.add_argument("--max-decisions", type=int, default=40)
     ap.add_argument("--run-name", default="real_grasp")
     a = ap.parse_args()

@@ -3,7 +3,7 @@ import time
 
 import numpy as np
 
-from dlb.harness.marking import Marks, OverheadGuide, TableMap, summarize
+from dlb.harness.marking import Marks, OverheadGuide, TableMap, box_centred, fit_scale, summarize
 from dlb.harness.twotier import (
     OVERHEAD_ORDER,
     TRANSPORT_Z,
@@ -23,7 +23,7 @@ def _camera(xy: np.ndarray, s: float = 660.0, rot_deg: float = 8.0, c=(350.0, 40
 
 
 def test_prior_map_points_the_right_way():
-    m = TableMap(px_per_m=900.0)  # scale overestimated, as from the cube's bounding box
+    m = TableMap(px_per_m=900.0)  # scale overestimated, as from marks of the gripper above the table
     m.add(np.array([0.19, 0.0]), _camera(np.array([0.19, 0.0])))
     cube = np.array([0.20, -0.04])
     est = m.to_table(_camera(cube))
@@ -44,7 +44,7 @@ def test_spread_marks_recover_the_camera():
 
 def test_close_noisy_marks_keep_the_prior_rotation():
     # the first real run: pairs 3-4 cm apart plus ~5 px marking noise fitted a -46 degree rotation
-    m = TableMap(px_per_m=750.0)  # the cube box's scale after the box-per-edge correction
+    m = TableMap(px_per_m=750.0)
     rng = np.random.default_rng(0)
     for xy in ([0.187, -0.001], [0.179, -0.035], [0.174, -0.054]):
         m.add(np.array(xy), _camera(np.array(xy), rot_deg=0.0) + rng.normal(0, 5, 2))
@@ -93,10 +93,14 @@ def test_bin_centre_from_point_and_box():
         for _ in range(3)
     ]
     m = summarize(raw, 1000, 1000)
+    assert np.allclose(m.points["bin"], [300, 400]) and m.points["gripper"] is None  # the marked centres
+    box_centred(m, "bin")  # what the guide does for the configured bin, whatever the objects are called
     assert np.allclose(m.points["bin"], [305, 405])  # mean of the marked centre and the box centre
-    assert m.points["gripper"] is None and abs(m.cube_size_px - 20) < 1e-9
+    assert np.allclose(m.points["cube"], [500, 500])
     raw[0]["bin"] = raw[1]["bin"] = [100, 100]  # a centre outside its box: the box's centre alone
-    assert np.allclose(summarize(raw, 1000, 1000).points["bin"], [310, 410])
+    m = summarize(raw, 1000, 1000)
+    box_centred(m, "bin")
+    assert np.allclose(m.points["bin"], [310, 410])
 
 
 # --------------------------------------------------------------------------- #
@@ -104,7 +108,7 @@ def test_bin_centre_from_point_and_box():
 # logs did not record, read back from the saved mark images)
 # --------------------------------------------------------------------------- #
 REAL = {
-    # begin tcp, first mark (gripper, spread, cube, bin, cube box px), tcp after goto_cube, second mark,
+    # begin tcp, first mark (gripper, spread, cube, bin, px per 3.6 cm), tcp after goto_cube, second mark,
     # grasp tcp, bin centre from the release image (the gripper's position over the bin; +-1.5 cm)
     "real_overhead1": dict(
         begin=(0.1859, -0.0002, 0.0885),
@@ -127,7 +131,12 @@ REAL = {
 
 def _marks(g, gs, c, b, size) -> Marks:
     pts = {"gripper": np.array(g, float), "cube": np.array(c, float), "bin": np.array(b, float)}
-    return Marks(pts, size, {"gripper": gs, "cube": 1.0, "bin": 1.0}, 0.0, [], {"cube": None, "bin": None})
+    return Marks(pts, {"gripper": gs, "cube": 1.0, "bin": 1.0}, 0.0, [], {"cube": None, "bin": None})
+
+
+def _guide(marker, r) -> OverheadGuide:
+    # the scale those runs worked with (it now comes from the start-up calibration)
+    return OverheadGuide(marker, TableMap(px_per_m=r["m1"][4] / 0.036))
 
 
 class _ReplayEnv:
@@ -158,7 +167,7 @@ def test_replay_real_runs_release_near_the_bin():
     for name, r in REAL.items():
         env = _ReplayEnv(r["begin"], r["after"])
         marker = _ListMarker([_marks(*r["m1"]), _marks(*r["m2"])])
-        g = OverheadGuide(marker)
+        g = _guide(marker, r)
         g.start_background(env, kind="begin")
         assert g.goto(env, "cube", 0.12).log[0]["begin_mark"] == "used"
         env.tcp_pos = np.array(r["grasp"])
@@ -175,7 +184,7 @@ def test_failed_begin_mark_falls_back_to_a_foreground_mark():
     r = REAL["real_overhead2"]
     env = _ReplayEnv(r["begin"], r["after"])
     marker = _ListMarker([_marks(*r["m1"]), _marks(*r["m2"])], fail_first=True)
-    g = OverheadGuide(marker)
+    g = _guide(marker, r)
     g.start_background(env, kind="begin")
     rec = g.goto(env, "cube", 0.12).log[0]
     assert rec["begin_mark"] == "failed" and rec["mark_kind"] == "foreground"
@@ -186,7 +195,7 @@ def test_failed_begin_mark_falls_back_to_a_foreground_mark():
 def test_begin_mark_overlaps_the_reset():
     r = REAL["real_overhead2"]
     env = _ReplayEnv(r["begin"], r["after"])
-    g = OverheadGuide(_ListMarker([_marks(*r["m1"]), _marks(*r["m2"])], delay=0.3))
+    g = _guide(_ListMarker([_marks(*r["m1"]), _marks(*r["m2"])], delay=0.3), r)
     t0 = time.perf_counter()
     g.start_background(env, kind="begin")
     time.sleep(0.25)  # the rest of the reset
@@ -242,7 +251,7 @@ class _TruthMarker:
         self.calls += 1
         f = self.env.frames[int(img[0, 0, 0])]
         pts = {k: _camera(v, rot_deg=0.0) for k, v in f.items()}
-        return Marks(pts, 0.03 * 660 * OverheadGuide.BOX_PER_EDGE, {k: 1.0 for k in pts}, 0.0, [], {})
+        return Marks(pts, {k: 1.0 for k in pts}, 0.0, [], {})
 
 
 def test_runner_starts_marking_at_the_begin_pose_and_returns_there(tmp_path):
@@ -258,7 +267,14 @@ def test_runner_starts_marking_at_the_begin_pose_and_returns_there(tmp_path):
     )
     r = runner.run(0, seed=3)
     assert r.success and r.stop_reason == "planner_complete", (r.subtasks, r.stop_reason)
-    assert env.poses == ["begin", "begin"] and marker.calls == 2
+    # the first reset measures the scale: the calibration poses, back to the begin pose, then the two marks
+    n = len(OverheadGuide.CALIB_OFFSETS)
+    assert env.poses == ["begin", "begin", "begin"] and marker.calls == n + 2
+    assert (
+        abs(runner.guide.calibration["px_per_cm"] - 6.6) < 0.05 and runner.guide.calibration["inliers"] == n
+    )
+    r = runner.run(1, seed=4)  # the scale is measured once
+    assert r.success and env.poses.count("begin") == 5 and marker.calls == n + 4
     recs = [json.loads(line) for line in open(tmp_path / "ep0000.jsonl")]
     guide = [x for x in recs if x["type"] == "guide"]
     assert guide[0]["log"][0]["begin_mark"] == "used"
@@ -380,7 +396,7 @@ def test_marks_keyed_by_object_name():
     ] * 3
     m = summarize(raw, 1000, 1000, objects=objs)
     assert m.points["blue cube"] is None and np.allclose(m.points["red cube"], [600, 500])
-    assert np.allclose(m.points["black bin"], [305, 405]) and abs(m.cube_size_px - 20) < 1e-9
+    assert np.allclose(m.points["black bin"], [300, 400])
 
 
 def test_goto_refuses_an_object_inside_the_bin():
@@ -394,7 +410,7 @@ def test_goto_refuses_an_object_inside_the_bin():
         "black bin": np.array([243.0, 283.0]),
     }
     boxes = {"orange cube": np.array([235.0, 270, 255, 290]), "black bin": np.array([204.0, 245, 283, 320])}
-    m = Marks(pts, 20.0, {k: 1.0 for k in pts}, 0.0, [], boxes)
+    m = Marks(pts, {k: 1.0 for k in pts}, 0.0, [], boxes)
     g.marker.mark = lambda img: m
 
     class E:
@@ -405,3 +421,175 @@ def test_goto_refuses_an_object_inside_the_bin():
 
     r = g.goto(E(), "cube", 0.12)
     assert not r.ok and "inside the black bin" in r.reason
+
+
+def test_pick_target_keeps_its_marked_centre_whatever_it_is_called():
+    class M:
+        names = ("carrot plush toy", "white tape roll", "black bin")
+
+    g = OverheadGuide(M(), roles={"cube": "carrot plush toy", "bin": "black bin"})
+    pts = {
+        "gripper": np.array([266.0, 250.0]),
+        "carrot plush toy": np.array([240.0, 135.0]),
+        "white tape roll": np.array([262.0, 215.0]),
+        "black bin": np.array([160.0, 262.0]),
+    }
+    boxes = {
+        "carrot plush toy": np.array([175.0, 105, 310, 167]),  # the leaves pull the box's centre off the body
+        "white tape roll": np.array([207.0, 157, 322, 275]),
+        "black bin": np.array([113.0, 207, 225, 315]),
+    }
+    g._use(None, np.array([0.187, 0.0, 0.093]), Marks(pts, {k: 1.0 for k in pts}, 0.0, [], boxes))
+    assert np.allclose(g.last["cube"], [240, 135])  # not mixed with its box, although not a "cube"
+    assert np.allclose(g.last["bin"], [164.5, 261.5])  # the bin: mean of the mark and the box's centre
+    assert list(g._static) == ["black bin"]  # only the bin counts as static
+    g.set_targets(place="white tape roll")  # stacking on another object: its latest mark, by role not by name
+    assert np.allclose(g.last["bin"], [262, 215])
+
+
+# --------------------------------------------------------------------------- #
+# start-up calibration: the scale from the gripper's marks at known poses
+# --------------------------------------------------------------------------- #
+BEGIN = np.array([0.187, 0.0, 0.093])
+
+
+def _ring(noise=0.0, seed=0, **cam):
+    rng = np.random.default_rng(seed)
+    xy = np.array([BEGIN[:2] + d for d in OverheadGuide.CALIB_OFFSETS])
+    uv = np.array([_camera(p, **cam) for p in xy]) + rng.normal(0, noise, (len(xy), 2))
+    return xy, uv
+
+
+def test_fit_scale_recovers_the_camera():
+    xy, uv = _ring(s=1150.0, rot_deg=4.0, c=(266.0, 465.0))
+    f = fit_scale(xy, uv)
+    assert f.ok and f.inlier.all() and abs(f.px_per_m - 1150) < 1e-6 and abs(f.rotation_deg - 4.0) < 1e-6
+    for seed in range(20):  # gripper marks scatter by several pixels
+        xy, uv = _ring(noise=6.0, seed=seed, s=1150.0, rot_deg=0.0, c=(266.0, 465.0))
+        f = fit_scale(xy, uv)
+        assert f.ok and abs(f.px_per_m / 1150 - 1) < 0.08, (seed, f.describe())
+
+
+def test_fit_scale_rejects_a_wrong_mark():
+    # the real failure: after a 6 cm sideways step the gripper was marked 70 px straight down the image; with the
+    # begin pose alone that reads 4.4 px/cm instead of ~11.5
+    xy, uv = _ring(noise=4.0, s=1150.0, rot_deg=0.0, c=(266.0, 465.0))
+    xy = np.vstack([xy, BEGIN[:2] + [0.0, -0.061]])
+    uv = np.vstack([uv, uv[0] + [0.0, 70.0]])
+    f = fit_scale(xy, uv)
+    assert f.ok and not f.inlier[-1] and f.inlier[:-1].all() and f.residual_px[-1] > 60
+    assert abs(f.px_per_m / 1150 - 1) < 0.05
+    # those two poses alone: the displacement points the wrong way, nothing is fitted
+    f = fit_scale(xy[[0, -1]], uv[[0, -1]])
+    assert not f.ok and "agree" in f.reason
+    # two wrong marks among nine poses are rejected as well; four leave too few
+    xy, uv = _ring(noise=4.0, s=1150.0, rot_deg=0.0, c=(266.0, 465.0))
+    uv[3] += [60.0, 20.0]
+    uv[6] += [-35.0, 50.0]
+    f = fit_scale(xy, uv)
+    assert f.ok and not f.inlier[3] and not f.inlier[6] and abs(f.px_per_m / 1150 - 1) < 0.06
+    uv[1] += [0.0, 80.0]
+    uv[8] += [90.0, 0.0]
+    uv[4] += [-50.0, -50.0]
+    assert not fit_scale(xy, uv).ok
+
+
+def test_fit_scale_refuses_implausible_fits():
+    xy, uv = _ring(s=1150.0, rot_deg=0.0, c=(266.0, 465.0))
+    assert not fit_scale(xy, np.array([640.0, 480.0]) - uv).ok  # the image upside down (cameras.front.rotate)
+    assert not fit_scale(*_ring(s=300.0, rot_deg=0.0)).ok  # 3 px/cm: not this table
+    assert not fit_scale(xy[:, :1] * [1, 0] + [0, 0.0], uv).ok  # poses on a line: no spread in y
+    assert fit_scale(xy, 2 * uv, width=1280).ok  # the limits scale with the image
+
+
+class _CalEnv:
+    """An arm that goes where it is told, seen by the synthetic camera."""
+
+    def __init__(self, unreachable=()):
+        self.tcp_pos, self.unreachable, self.poses, self.moves = BEGIN.copy(), unreachable, [], 0
+
+    def overhead_frame(self):
+        img = np.zeros((480, 640, 3), np.uint8)
+        img[0, 0, :2] = np.round((self.tcp_pos[:2] - BEGIN[:2]) * 1000 + 128)  # the pose, for the fake marker
+        return img
+
+    def _move_tcp(self, target):
+        if any(np.allclose(target[:2] - BEGIN[:2], u) for u in self.unreachable):
+            raise RuntimeError("no IK solution")
+        self.tcp_pos, self.moves = np.array(target, float), self.moves + 1
+
+    def go_pose(self, name):
+        self.poses.append(name)
+        self.tcp_pos = BEGIN.copy()
+
+
+class _GripperMarker:
+    """Marks the gripper through the synthetic camera; ``wrong`` maps a pose index to the answers it gives there
+    (pixel offsets, one per time it is asked; the last one repeats)."""
+
+    names = ("carrot", "bin")
+
+    def __init__(self, wrong=None):
+        self.wrong, self.asked = wrong or {}, {}
+
+    def mark_gripper(self, img):
+        d = (img[0, 0, :2].astype(float) - 128) / 1000
+        k = next((i for i, o in enumerate(OverheadGuide.CALIB_OFFSETS) if np.allclose(o, d)), -1)
+        n = self.asked[k] = self.asked.get(k, 0) + 1
+        off = self.wrong.get(k, [(0, 0)])
+        uv = _camera(BEGIN[:2] + d, s=1150.0, rot_deg=0.0, c=(266.0, 465.0)) + off[min(n, len(off)) - 1]
+        return Marks({"gripper": uv}, {"gripper": 2.0}, 0.0, [{"gripper": uv.tolist()}], {})
+
+
+def test_calibration_sets_the_scale_and_logs(tmp_path):
+    env, marker = _CalEnv(), _GripperMarker(wrong={7: [(0, 70)]})  # one pose is always marked wrongly
+    g = OverheadGuide(marker, log_dir=tmp_path)
+    assert g.needs_calibration and not g.map.ready
+    rec = g.calibrate(env)
+    n = len(OverheadGuide.CALIB_OFFSETS)
+    assert rec["ok"] and rec["inliers"] == n - 1 and abs(rec["px_per_cm"] - 11.5) < 0.01
+    assert [p["inlier"] for p in rec["poses"]] == [i != 7 for i in range(n)]
+    assert marker.asked[7] == 1 and env.moves == n - 1  # accepted at once: no second mark, no extra poses
+    assert env.poses == ["begin"] and np.allclose(env.tcp_pos, BEGIN)
+    assert not g.needs_calibration and g.map.ready and len(g.map.xy) == n - 1
+    assert abs(g.map.prior_scale - 1150) < 1 and abs(g.map.describe()["px_per_cm"] - 11.5) < 0.01
+    target = np.array([0.24, -0.11])
+    assert (
+        np.linalg.norm(g.map.to_table(_camera(target, s=1150.0, rot_deg=0.0, c=(266.0, 465.0))) - target)
+        < 1e-3
+    )
+    assert len(list(tmp_path.glob("calib_*.jpg"))) == n
+    assert json.loads((tmp_path / "calib.jsonl").read_text())["poses"][7]["inlier"] is False
+
+
+def test_calibration_marks_again_then_adds_poses():
+    # five poses marked wrongly at first: too few agree, the same images are marked again and then agree
+    off = [(0, 70), (60, -30), (-50, 40), (30, 90), (-70, -60)]
+    wrong = {i: [o, (0, 0)] for i, o in zip((1, 2, 4, 6, 8), off, strict=True)}
+    env, marker = _CalEnv(), _GripperMarker(wrong=wrong)
+    g = OverheadGuide(marker)
+    rec = g.calibrate(env)
+    assert rec["ok"] and rec["inliers"] == 9 and marker.asked[2] == 2 and marker.asked[0] == 1
+    assert env.poses == ["begin"]  # no extra poses needed
+    # always wrong there, and one pose out of reach: the extra poses bring enough agreeing marks
+    wrong = {i: [o] for i, o in zip((1, 2, 4, 6), off, strict=False)}
+    env, marker = _CalEnv(unreachable=[OverheadGuide.CALIB_OFFSETS[8]]), _GripperMarker(wrong=wrong)
+    g = OverheadGuide(marker)
+    rec = g.calibrate(env)
+    assert (
+        rec["ok"]
+        and rec["pairs"] == 8 + len(OverheadGuide.CALIB_EXTRA)
+        and rec["inliers"] == rec["pairs"] - 4
+    )
+    assert env.poses == ["begin", "begin"] and abs(rec["px_per_cm"] - 11.5) < 0.01
+
+
+def test_calibration_fails_loudly():
+    import pytest
+
+    wrong = {i: [(0, 70 + 15 * i)] for i in range(1, 9)}  # nothing agrees
+    env = _CalEnv()
+    g = OverheadGuide(_GripperMarker(wrong=wrong))
+    with pytest.raises(RuntimeError, match="overhead calibration failed"):
+        g.calibrate(env)
+    assert g.needs_calibration and not g.map.xy and env.poses[-1] == "begin"  # nothing half-set, arm at begin
