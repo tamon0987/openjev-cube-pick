@@ -6,7 +6,7 @@ from typing import Any
 
 from dlb.johnny.skills import rig
 from dlb.johnny.skills.base import Context, Skill, SkillResult
-from dlb.johnny.skills.teleop import stop_teleop, teleop_running
+from dlb.johnny.skills.teleop import stop_teleop, teleop_line, teleop_running
 
 
 class StopAll(Skill):
@@ -26,7 +26,7 @@ class StopAll(Skill):
             done.append(f"{skill.name} cancelled (it stops after the current move)")
         if teleop_running(ctx):
             stop_teleop(ctx)
-            done.append("tele-operation stopped")
+            done.append("tele-operation stopped (relay and leader driver)")
         text = "; ".join(done) if done else "nothing was running"
         return SkillResult(f"{text}; the arm holds where it is", data={"stopped": done})
 
@@ -59,7 +59,7 @@ class Status(Skill):
                 held = None
         openjev, stt = rig.openjev_ok(), rig.stt_ok()
         parts = [
-            "task running" if task else ("tele-operation on" if teleop else "idle"),
+            "task running" if task else (teleop_line(ctx) if teleop else "idle"),
             ("robot started, holding " + (held or "nothing")) if agent is not None else "robot not started",
             "follower driver " + ("up" if follower else "down"),
             "openjev " + ("ok" if openjev else "down"),
