@@ -473,7 +473,14 @@ def test_close_closes_the_robot_env():
 
 
 def test_speaker_marks_its_own_speech():
-    sp = Speaker(out=open("/dev/null", "w"), grace_s=0.5)
+    class Played(Speaker):  # a speaker that really plays audio marks the span; the text-only one does not
+        def _play(self, text):
+            return True
+
+    silent = Speaker(out=open("/dev/null", "w"), grace_s=0.5)
+    silent.say("はい")
+    assert not silent._spans
+    sp = Played(out=open("/dev/null", "w"), grace_s=0.5)
     sp.say("はい")
     (s, e), *_ = sp._spans
     assert sp.overlaps(s - 1.0, s + 0.001) and sp.overlaps(e, e + 0.3)
