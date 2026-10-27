@@ -93,7 +93,7 @@ class Johnny:
         m = self.gate.feed(text, now)
         if m.kind == "stop":
             self.log(f"stop word: {text!r}")
-            self.stop()
+            self.stop(m.matched)
             return "stop"
         if m.kind == "wake":
             self.log(f"wake word ({m.matched}): {text!r}")
@@ -182,8 +182,9 @@ class Johnny:
 
     # ------------------------------------------------------------ stop
 
-    def stop(self) -> None:
-        """A stop word: cancel the running skill (or the one waiting for an answer), run the stop skill."""
+    def stop(self, word: str = "") -> None:
+        """A stop word: cancel the running skill (or the one waiting for an answer), run the stop skill.
+        ``word`` is the matched stop word: the stop skill may treat 停止/終了 while idle as a safe stop."""
         self._cancelled.set()
         self.gate.disarm("stop")
         with self._lock:
@@ -199,7 +200,11 @@ class Johnny:
         text = STOPPED_REPLY
         if stop_skill is not None and stop_skill not in (running, asking):
             try:
-                r = stop_skill.run(self.ctx)
+                r = (
+                    stop_skill.run(self.ctx, word=word)
+                    if "word" in stop_skill.parameters.get("properties", {})
+                    else stop_skill.run(self.ctx)
+                )
                 text = r.text or text
             except Exception as e:  # noqa: BLE001
                 self.log(f"stop skill failed: {e}")

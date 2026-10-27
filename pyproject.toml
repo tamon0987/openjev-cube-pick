@@ -49,3 +49,6 @@ testpaths = ["tests"]
 pythonpath = ["."]
 # a ROS 2-sourced shell adds launch_testing / launch_ros plugins, whose hooks fail on pytest 9
 addopts = "-p no:launch_testing -p no:launch_ros"
+
+[tool.ruff.lint.isort]
+known-third-party = ["launch", "launch_ros"]  # ROS 2 launch packages (not the repo's launch files)
