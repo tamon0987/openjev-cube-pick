@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import threading
 import time
@@ -6,7 +7,15 @@ import time
 import httpx
 import pytest
 
-from dlb.johnny.agent import BUSY_REPLY, CANCELLED_OUTPUT, STOPPED_REPLY, WAKE_REPLY, Johnny
+from dlb.johnny.agent import (
+    BUSY_REPLY,
+    CANCELLED_OUTPUT,
+    STOPPED_REPLY,
+    WAKE_REPLY,
+    Johnny,
+    Listener,
+    Shutdown,
+)
 from dlb.johnny.history import History
 from dlb.johnny.llm import LLM
 from dlb.johnny.skills.base import Context, Skill, SkillResult
@@ -467,6 +476,132 @@ def test_close_closes_the_robot_env():
     j.ctx.robot = Robot()
     j.close()
     assert Robot.env.closed == 1
+
+
+# ---------------------------------------------------------------- shutdown (SIGINT / SIGTERM path)
+
+
+class FakeListener(Listener):
+    def __init__(self):
+        super().__init__()
+        self.stops = 0
+
+    def stop(self):
+        self.stops += 1
+        self.stopped.set()
+
+
+def test_shutdown_order_and_timeouts():
+    """A blocking robot close, a skill that runs until cancelled, a launch that ignores SIGINT: each step is
+    time-boxed, the order is listen -> skill -> robot -> processes, and the whole thing stays short."""
+
+    class SlowEnv:
+        def __init__(self):
+            self.closing = threading.Event()
+
+        def close(self):
+            self.closing.set()
+            time.sleep(30)  # e.g. RealOMX.close stuck in an executor shutdown
+
+    class Robot:
+        env = SlowEnv()
+
+    logs: list[str] = []
+    fake = FakeSkill(block=True)
+    listener = FakeListener()
+    sp = Spoken()
+    j = Johnny(
+        Registry([(fake.name, fake)]),
+        scripted([[_call("fake", {"what": "long"})], [_message("止めました。")]]),
+        sp,
+        log=logs.append,
+        listener=listener,
+    )
+    j.ctx.robot = Robot()
+    polite = subprocess.Popen(["sleep", "100"], start_new_session=True)  # dies on SIGINT
+    stubborn = subprocess.Popen(
+        ["bash", "-c", "trap '' INT; sleep 100"], start_new_session=True
+    )  # needs SIGKILL
+    j.ctx.processes = {"polite": polite, "stubborn": stubborn}
+    j.hear("ジョニー、長い作業をして")
+    assert fake.started.wait(5.0) and j.busy
+    try:
+        took = j.close(worker_s=1.0, robot_s=0.3, process_s=0.5)
+    finally:
+        for p in (polite, stubborn):
+            if p.poll() is None:
+                p.kill()
+    assert took < 4.0
+    assert listener.stops == 1
+    assert fake.cancelled == 1 and not j.busy  # the skill returned after cancel; the worker finished
+    assert Robot.env.closing.is_set()
+    assert polite.poll() is not None and stubborn.poll() is not None
+    steps = [m for m in logs if m.startswith("shutdown")]
+    assert [m.split(":")[0] for m in steps] == [
+        "shutdown 1/4",
+        "shutdown 2/4",
+        "shutdown 3/4",
+        "shutdown 4/4",
+        "shutdown done in " + steps[-1].split(":")[0].split("in ")[1],
+    ]
+    assert "  fake cancelled" in logs
+    assert any("robot close still busy after 0 s" in m for m in logs)
+    assert any("SIGINT polite" in m for m in logs) and "  polite stopped" in logs
+    assert any("stubborn still running" in m and "SIGKILL" in m for m in logs)
+
+
+def test_close_with_nothing_running_is_quick():
+    logs: list[str] = []
+    j, _ = _johnny([FakeSkill()], scripted([]))
+    j.log = logs.append
+    assert j.close() < 0.5
+    assert "  nothing running" in logs and "  no robot" in logs and "  no processes" in logs
+
+
+def test_listener_stops_arecord_like_process():
+    lst = Listener()
+    p = subprocess.Popen(["sleep", "100"])
+    lst.attach(p)
+    lst.stop()
+    assert p.poll() is not None and lst.stopped.is_set()
+    late = Listener()
+    late.stop()  # before the process exists
+    q = subprocess.Popen(["sleep", "100"])
+    late.attach(q)  # terminated on arrival
+    q.wait(timeout=2.0)
+    assert q.poll() is not None
+
+
+def test_signal_handling_first_requests_second_exits_and_watchdog_forces():
+    logs: list[str] = []
+    exits: list[int] = []
+    sd = Shutdown(logs.append, watchdog_s=0.2, exit=exits.append)
+    sd.request("SIGINT")
+    assert sd.requested.is_set() and exits == []
+    sd.done.set()  # a clean shutdown: the watchdog stays quiet
+    time.sleep(0.4)
+    assert exits == []
+    sd.request("SIGINT")
+    assert exits == [130] and any("second SIGINT" in m for m in logs)
+    slow = Shutdown(logs.append, watchdog_s=0.2, exit=exits.append)
+    slow.request("SIGTERM")
+    time.sleep(0.5)  # never done: the watchdog force-exits
+    assert exits == [130, 3] and any("watchdog" in m for m in logs)
+
+
+def test_debug_logs_the_wake_window():
+    logs: list[str] = []
+    j, _ = _johnny([FakeSkill()], scripted([[_message("どれですか？")]]), debug=True)
+    j.log = j.gate.log = logs.append
+    j.hear("ジョニー", now=0.0)
+    j.hear("あれ", now=20.0)  # too late
+    assert any("wake window open for 8 s (wake word)" in m for m in logs)
+    assert any("wake window expired 12.0 s ago (utterance after the window)" in m for m in logs)
+    j.hear("ジョニー、どれか取って")
+    _wait(j)
+    assert any("open for 8 s (Johnny asked a question)" in m for m in logs)
+    j.hear("赤いの")
+    assert any("closed (command in the window)" in m for m in logs)
 
 
 # ---------------------------------------------------------------- speaker

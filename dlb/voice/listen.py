@@ -26,7 +26,7 @@ import threading
 import time
 import wave
 from collections import deque
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -58,9 +58,12 @@ class MicUnavailable(RuntimeError):
 # ---------------------------------------------------------------- audio sources
 
 
-def mic_frames(device: str = "default", frame: int = FRAME) -> Iterator[np.ndarray]:
+def mic_frames(
+    device: str = "default", frame: int = FRAME, on_start: Callable[[subprocess.Popen], None] | None = None
+) -> Iterator[np.ndarray]:
     """16 kHz mono int16 frames from ``arecord``. A reader thread drains the pipe, so a slow consumer (the
-    transcription runs in the caller's loop) queues audio instead of making arecord overrun."""
+    transcription runs in the caller's loop) queues audio instead of making arecord overrun. ``on_start``
+    gets the arecord process, so a caller on another thread can end the stream (terminate it)."""
     if shutil.which("arecord") is None:
         raise MicUnavailable("arecord not found (sudo apt install alsa-utils)")
     p = subprocess.Popen(
@@ -68,6 +71,8 @@ def mic_frames(device: str = "default", frame: int = FRAME) -> Iterator[np.ndarr
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    if on_start is not None:
+        on_start(p)
     q: queue.Queue[bytes | None] = queue.Queue()
 
     def reader() -> None:

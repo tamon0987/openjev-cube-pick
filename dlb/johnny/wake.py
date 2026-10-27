@@ -191,15 +191,29 @@ class WakeWord:
 
 
 class WakeGate:
-    """``WakeWord`` plus the listening window after a bare wake word (or after the agent asked back)."""
+    """``WakeWord`` plus the listening window after a bare wake word (or after the agent asked back).
+    ``log`` (optional) is told when the window opens, closes and expires: with --debug this shows why an
+    utterance was taken as a command or dropped."""
 
-    def __init__(self, wake: WakeWord | None = None, window_s: float = 8.0):
+    def __init__(self, wake: WakeWord | None = None, window_s: float = 8.0, log=None):
         self.wake = wake or WakeWord()
         self.window_s = window_s
         self.armed_until = 0.0
+        self.log = log
 
-    def arm(self, now: float | None = None) -> None:
-        self.armed_until = (time.monotonic() if now is None else now) + self.window_s
+    def arm(self, now: float | None = None, seconds: float | None = None, why: str = "wake word") -> None:
+        now = time.monotonic() if now is None else now
+        seconds = self.window_s if seconds is None else seconds
+        self.armed_until = now + seconds
+        if self.log:
+            self.log(f"wake window open for {seconds:.0f} s ({why})")
+
+    def disarm(self, why: str, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        if self.log and self.armed_until:
+            state = "closed" if now < self.armed_until else f"expired {now - self.armed_until:.1f} s ago"
+            self.log(f"wake window {state} ({why})")
+        self.armed_until = 0.0
 
     def armed(self, now: float | None = None) -> bool:
         return (time.monotonic() if now is None else now) < self.armed_until
@@ -208,15 +222,17 @@ class WakeGate:
         now = time.monotonic() if now is None else now
         m = self.wake.match(text)
         if m.kind == "stop":
-            self.armed_until = 0.0
+            self.disarm("stop word", now)
             return m
         if m.kind == "command":
-            self.armed_until = 0.0
+            self.disarm("command with the wake word", now)
             return m
         if m.kind == "wake":
             self.arm(now)
             return m
         if self.armed(now):  # the utterance after a bare wake word (or an answer to a question)
-            self.armed_until = 0.0
+            self.disarm("command in the window", now)
             return Match("command", text.strip(), "window")
+        if self.armed_until:  # it was open once: say when it ran out
+            self.disarm("utterance after the window", now)
         return m

@@ -16,6 +16,7 @@ import json
 import os
 import queue
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -23,6 +24,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from dlb.harness.marking import load_env_file
 from dlb.johnny.history import History
 from dlb.johnny.llm import LLM, Reply
 from dlb.johnny.skills.base import Context, Skill, SkillResult
@@ -60,13 +62,15 @@ class Johnny:
         max_rounds: int = 8,
         log=None,
         debug: bool = False,
+        listener: Listener | None = None,
     ):
         self.skills = Registry(skills)
         self.llm, self.speaker = llm, speaker or Speaker()
         self.history = history or History()
         self.log = log or (lambda m: print(m, file=sys.stderr, flush=True))
         self.debug = debug
-        self.gate = WakeGate(wake, wake_window_s)
+        self.gate = WakeGate(wake, wake_window_s, log=self.log if debug else None)
+        self.listener = listener or Listener()
         self.ask_window_s = ask_window_s
         self.max_rounds = max_rounds
         self.ctx = ctx or Context()
@@ -126,12 +130,9 @@ class Johnny:
         self.speaker.say(reply)
         # the user answers without the wake word: a longer window when a skill waits for a physical step
         if self._asking is not None:
-            self._arm(self.ask_window_s)
+            self.gate.arm(seconds=self.ask_window_s, why="a skill waits for the user's answer")
         elif reply.rstrip().endswith(("?", "？")):
-            self._arm(self.gate.window_s)
-
-    def _arm(self, seconds: float) -> None:
-        self.gate.armed_until = time.monotonic() + seconds
+            self.gate.arm(why="Johnny asked a question")
 
     def _loop(self) -> str:
         tools = self.skills.tool_specs()
@@ -184,7 +185,7 @@ class Johnny:
     def stop(self) -> None:
         """A stop word: cancel the running skill (or the one waiting for an answer), run the stop skill."""
         self._cancelled.set()
-        self.gate.armed_until = 0.0
+        self.gate.disarm("stop")
         with self._lock:
             running, asking = self._running, self._asking
             self._asking = None
@@ -211,7 +212,14 @@ class Johnny:
             # the cancelled call's result reaches the model and the worker replies; acknowledge now anyway
             self.speaker.say("止めます。")
 
-    def close(self, timeout_s: float = 10.0) -> None:
+    def close(self, worker_s: float = 2.0, robot_s: float = 4.0, process_s: float = 8.0) -> float:
+        """Shut down in order, each step time-boxed so the whole thing takes at most ~15 s: stop listening,
+        cancel the running skill, close the robot, SIGINT the launched process groups (then SIGKILL what is
+        left). Returns the seconds it took. Every step is logged."""
+        t0 = time.monotonic()
+        self.log("shutdown 1/4: stop listening")
+        self.listener.stop()
+        self.log("shutdown 2/4: cancel the running skill")
         if self.busy:
             self._cancelled.set()
             with self._lock:
@@ -219,37 +227,151 @@ class Johnny:
             if running is not None:
                 try:
                     running.cancel(self.ctx)
+                    self.log(f"  {running.name} cancelled")
                 except Exception as e:  # noqa: BLE001
-                    self.log(f"cancel {running.name} failed: {e}")
+                    self.log(f"  cancel {running.name} failed: {e}")
             assert self._worker is not None
-            self._worker.join(timeout_s)
-        robot = self.ctx.robot
-        env = getattr(robot, "env", None)
+            self._worker.join(worker_s)
+            if self._worker.is_alive():
+                self.log(f"  the request is still running after {worker_s:.0f} s; going on")
+        else:
+            self.log("  nothing running")
+        self.log("shutdown 3/4: close the robot")
+        env = getattr(self.ctx.robot, "env", None)
         if env is not None and hasattr(env, "close"):
-            try:
-                env.close()
-            except Exception as e:  # noqa: BLE001
-                self.log(f"robot close failed: {e}")
-        for name, p in list(self.ctx.processes.items()):
-            if p.poll() is None:
-                self.log(f"terminating {name}")
-                try:  # the whole launch tree (its own session): SIGINT lets the nodes shut the hardware down
-                    os.killpg(p.pid, signal.SIGINT)
-                    p.wait(timeout=10)
-                except Exception:  # noqa: BLE001
-                    p.terminate()
+            # RealOMX.close joins ROS and camera threads; a hang there must not hold the shutdown
+            t = threading.Thread(target=self._close_env, args=(env,), daemon=True, name="robot-close")
+            t.start()
+            t.join(robot_s)
+            if t.is_alive():
+                self.log(f"  robot close still busy after {robot_s:.0f} s; going on")
+            else:
+                self.log("  robot closed")
+        else:
+            self.log("  no robot")
+        self.log("shutdown 4/4: stop the launched processes")
+        stop_processes(self.ctx.processes, process_s, self.log)
+        took = time.monotonic() - t0
+        self.log(f"shutdown done in {took:.1f} s")
+        return took
+
+    def _close_env(self, env: Any) -> None:
+        try:
+            env.close()
+        except Exception as e:  # noqa: BLE001
+            self.log(f"  robot close failed: {e}")
+
+
+def stop_processes(processes: dict[str, subprocess.Popen], timeout_s: float, log) -> None:
+    """SIGINT every process group at once (a launch shuts its nodes down on it), wait up to ``timeout_s`` for
+    all of them together, then SIGKILL the ones still there."""
+    alive = {n: p for n, p in processes.items() if p.poll() is None}
+    if not alive:
+        log("  no processes")
+        return
+    for name, p in alive.items():
+        log(f"  SIGINT {name} (pid {p.pid})")
+        _signal_group(p, signal.SIGINT)
+    deadline = time.monotonic() + timeout_s
+    while alive and time.monotonic() < deadline:
+        for name in [n for n, p in alive.items() if p.poll() is not None]:
+            log(f"  {name} stopped")
+            del alive[name]
+        if alive:
+            time.sleep(0.1)
+    for name, p in alive.items():
+        log(f"  {name} still running after {timeout_s:.0f} s: SIGKILL")
+        _signal_group(p, signal.SIGKILL)
+        try:
+            p.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            log(f"  {name} did not die")
+
+
+def _signal_group(p: subprocess.Popen, sig: signal.Signals) -> None:
+    try:
+        os.killpg(p.pid, sig)  # its own session (rig.spawn): the whole tree
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        p.send_signal(sig)
+
+
+class Listener:
+    """The microphone side as seen from the main thread: ``stop`` ends the stream (kills arecord) so the
+    speech thread, which may be blocked reading it, winds down."""
+
+    def __init__(self, log=None):
+        self.proc: subprocess.Popen | None = None
+        self.stopped = threading.Event()
+        self.log = log
+
+    def attach(self, p: subprocess.Popen) -> None:
+        self.proc = p
+        if self.stopped.is_set():  # stopped before arecord came up
+            p.terminate()
+
+    def stop(self) -> None:
+        self.stopped.set()
+        p = self.proc
+        if p is None or p.poll() is not None:
+            if self.log:
+                self.log("  no microphone process")
+            return
+        p.terminate()
+        try:
+            p.wait(timeout=1.0)
+            if self.log:
+                self.log("  arecord stopped")
+        except subprocess.TimeoutExpired:
+            p.kill()
+            if self.log:
+                self.log("  arecord killed")
+
+
+class Shutdown:
+    """SIGINT / SIGTERM: the first one asks the main loop to shut down and starts a watchdog that force-exits
+    the process if the shutdown overruns; a second one exits at once. The handlers only set flags: the work
+    is done by the main loop, outside the signal path."""
+
+    def __init__(self, log, watchdog_s: float = 20.0, exit=os._exit):
+        self.log, self.watchdog_s, self.exit = log, watchdog_s, exit
+        self.requested = threading.Event()
+        self.done = threading.Event()
+        self.count = 0
+
+    def request(self, why: str = "signal") -> None:
+        self.count += 1
+        if self.count > 1:
+            self.log(f"second {why}: exiting now")
+            self.exit(130)
+            return
+        self.log(f"{why}: shutting down (again to exit at once)")
+        self.requested.set()
+        threading.Thread(target=self._watchdog, daemon=True, name="shutdown-watchdog").start()
+
+    def _watchdog(self) -> None:
+        if not self.done.wait(self.watchdog_s):
+            self.log(f"shutdown watchdog: still not done after {self.watchdog_s:.0f} s, forcing exit")
+            self.exit(3)
+
+    def install(self) -> None:
+        """(Re)install the handlers. A library that puts its own in afterwards (rclpy.init on robot start)
+        may or may not chain to these, so the main loop installs them again once the robot is up."""
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda signum, frame: self.request(signal.Signals(signum).name))
 
 
 # ---------------------------------------------------------------- speech in
 
 
-def _speech(args: argparse.Namespace, out: queue.Queue, log) -> None:
+def _speech(args: argparse.Namespace, out: queue.Queue, log, listener: Listener) -> None:
     """Transcripts into ``out`` as ``(text, t_start, t_end)`` (monotonic); None at the end."""
     try:
         if args.text:
             print("type (wake word first, e.g. ジョニー、…; empty line or Ctrl-D to quit)", file=sys.stderr)
             for line in sys.stdin:
-                if not line.strip():
+                if not line.strip() or listener.stopped.is_set():
                     break
                 now = time.monotonic()
                 out.put((line.strip(), now, now))
@@ -277,9 +399,15 @@ def _speech(args: argparse.Namespace, out: queue.Queue, log) -> None:
             )
             return
         seg = SileroSegmenter() if SILERO_MODEL.exists() else Segmenter()
-        frames = file_frames(args.file, realtime=args.realtime) if args.file else mic_frames(args.device)
+        frames = (
+            file_frames(args.file, realtime=args.realtime)
+            if args.file
+            else mic_frames(args.device, on_start=listener.attach)
+        )
         print("listening... (say the wake word first)", file=sys.stderr, flush=True)
         for u in listen(frames, tr, seg):
+            if listener.stopped.is_set():
+                break
             t_end = time.monotonic() - u.eou_s
             print(f"[heard {u.audio_s:.1f} s, text after {u.eou_s:.1f} s] {u.text}", flush=True)
             out.put((u.text, t_end - u.audio_s, t_end))
@@ -348,7 +476,12 @@ def main(argv: list[str] | None = None) -> int:
         history = History.load(args.history, max_turns=args.max_turns)
         if history.items:
             print(f"history: {history.turns()} turns from {args.history}", file=sys.stderr)
+    load_env_file(args.env_file)
+    if not os.environ.get("OPENAI_API_KEY"):
+        print(f"OPENAI_API_KEY is not set (put it in {args.env_file}; see docs/voice.md)", file=sys.stderr)
+        return 2
     speaker = make_speaker(args.tts, voice=args.voice, env_file=args.env_file, log=log)
+    listener = Listener(log)
     johnny = Johnny(
         skills,
         LLM(args.model, args.effort or None, env_file=args.env_file),
@@ -359,18 +492,25 @@ def main(argv: list[str] | None = None) -> int:
         ask_window_s=args.ask_window,
         log=log,
         debug=args.debug,
+        listener=listener,
     )
+    shutdown = Shutdown(log)
+    shutdown.install()
     heard: queue.Queue = queue.Queue()
-    threading.Thread(target=_speech, args=(args, heard, log), daemon=True).start()
+    threading.Thread(target=_speech, args=(args, heard, log, listener), daemon=True).start()
+    robot_seen = False
     try:
-        while True:
+        while not shutdown.requested.is_set():
+            if not robot_seen and johnny.ctx.robot is not None:
+                robot_seen = True
+                shutdown.install()  # rclpy.init put its own SIGINT/SIGTERM handlers in: ours again
             try:
                 item = heard.get(timeout=0.5)
             except queue.Empty:
                 continue
             if item is None:
                 if args.file or args.text:
-                    while johnny.busy:  # let the last request finish
+                    while johnny.busy and not shutdown.requested.is_set():  # let the last request finish
                         time.sleep(0.2)
                 break
             text, t_start, t_end = item
@@ -378,8 +518,19 @@ def main(argv: list[str] | None = None) -> int:
                 log(f"ignored (Johnny was speaking): {text!r}")
                 continue
             johnny.hear(text)
-    except KeyboardInterrupt:
-        print("\nstopping", file=sys.stderr)
+    except KeyboardInterrupt:  # the handler is ours, but just in case
+        shutdown.request("KeyboardInterrupt")
     finally:
+        if not shutdown.requested.is_set():
+            shutdown.request("end of input")
+        print("\nstopping", file=sys.stderr)
         johnny.close()
+        shutdown.done.set()
+        lingering = [
+            t.name for t in threading.enumerate() if t is not threading.main_thread() and not t.daemon
+        ]
+        if lingering:  # the interpreter would wait for these forever
+            log(f"exiting with non-daemon threads still alive: {lingering}")
+            sys.stderr.flush()
+            os._exit(0)
     return 0
