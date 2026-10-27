@@ -107,6 +107,7 @@ def fake(monkeypatch, tmp_path):
     monkeypatch.setattr(rig, "stop", stop)
     monkeypatch.setattr(pick_place.time, "sleep", lambda s: None)
     monkeypatch.setattr(teleop.time, "sleep", lambda s: None)
+    monkeypatch.setattr(control.time, "sleep", lambda s: None)
     monkeypatch.setattr(identify, "save_frame", lambda frame, path: None)
     monkeypatch.setattr(identify, "save_front_sheet", lambda frame, path: None)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -237,6 +238,7 @@ def test_rig_status_reports_missing_and_asks_for_hands(fake, ctx):
         "openjev": False,
         "stt": False,
         "openai": True,
+        "robot": False,
     }
     assert "identify_arms" in r.data["suggest"]  # the ports are assumed from the numbers
 
@@ -246,7 +248,14 @@ def test_rig_status_all_ok(fake, ctx):
     fake.http = {f"{rig.OPENJEV_URL}/health": True, f"{rig.STT_URL}/health": True}
     ctx.state["arms"] = {"follower": {"by_id": ARM_A}, "leader": {"by_id": ARM_B}}
     r = setup.RigStatus().run(ctx)
+    assert not r.ok and "robot not started" in r.text  # everything up, but the robot is not started yet
+    ctx.robot = SimpleNamespace(
+        guide=SimpleNamespace(calibration={"px_per_cm": 12.0, "inliers": 9, "pairs": 9}),
+        env=SimpleNamespace(),
+    )
+    r = setup.RigStatus().run(ctx)
     assert r.ok and "ask_user" not in r.data and r.data["suggest"] == []
+    assert "robot started, overhead calibrated (12.0 px/cm, 9 of 9 poses)" in r.text
 
 
 def test_rig_status_unknown_camera_suggests_identify(fake, ctx):
@@ -271,6 +280,7 @@ def test_rig_setup_starts_what_is_missing(fake, ctx):
         "started the follower driver" in r.text and "docker start openjev" in r.text and "1-3 min" in r.text
     )
     assert r.data["checks"]["follower"] is True and r.data["checks"]["openjev"] is False  # not healthy yet
+    assert r.data["checks"]["robot"] is False and "robot not started yet (openjev not ready)" in r.text
 
 
 def test_rig_setup_only_what_was_asked(fake, ctx):
@@ -297,16 +307,19 @@ def test_rig_setup_no_follower_port(fake, ctx):
     assert not r.ok and "no follower arm port" in r.text and r.data["ask_user"]
 
 
-def test_rig_shutdown_stops_launches_and_releases_the_robot(fake, ctx):
+def test_rig_shutdown_is_the_safe_stop_sequence(fake, ctx):
     ctx.processes["leader"], ctx.processes["follower"] = FakePopen(1), FakePopen(2)
     ctx.state["teleop"] = True
-    closed = []
-    ctx.robot = SimpleNamespace(env=SimpleNamespace(close=lambda: closed.append(1)))
+    env = FakeEnv()
+    env.held = True
+    ctx.robot = SimpleNamespace(env=env)
     fake.docker = {"openjev": "running", "stt": "running"}
     r = setup.RigShutdown().run(ctx, docker=True)
-    assert fake.stopped == ["leader", "follower"] and closed == [1] and ctx.robot is None
-    assert ctx.state["teleop"] is False and r.data["docker"] == ["openjev", "stt"]
+    assert r.ok and fake.stopped == ["leader", "follower"] and ctx.robot is None
+    assert env.calls == ["open", "go_pose rest", "close"]
+    assert ctx.state["teleop"] is False and "docker stopped: openjev, stt" in r.text
     assert ["docker", "stop", "openjev", "stt"] in fake.commands
+    assert r.data["steps"][:2] == ["tele-operation stopped", "gripper opened (the held object was let go)"]
 
 
 # ------------------------------------------------------------------ #
@@ -523,6 +536,12 @@ class FakeEnv:
         self.held, self.calls, self._stamp = False, [], 0.0
         self.tcp_pos = np.array([0.2, 0.0, 0.1])
 
+    def overhead_frame(self):
+        return np.zeros((48, 64, 3), np.uint8)
+
+    def render_all(self):
+        return {"wrist": np.zeros((32, 32, 3), np.uint8), "front": self.overhead_frame()}
+
     def reset(self, seed=None):
         self.calls.append("reset")
 
@@ -542,8 +561,58 @@ class FakeEnv:
 class FakeRunner:
     max_decisions, max_planner_calls = 40, 12
 
+    def __init__(self):
+        self.policy = SimpleNamespace(be=object())  # the one Jev client: the held check is built on it
+        self.held_check, self.log_dir, self.stop_reason = None, None, "planner_complete"
+
     def run(self, episode, seed, reset=True, keep_marks=False):
-        return SimpleNamespace(stop_reason="planner_complete", decisions=7, missed_grasps=0)
+        return SimpleNamespace(stop_reason=self.stop_reason, decisions=7, missed_grasps=0, drops=0)
+
+
+class FakeMap:
+    ready = True
+
+    def to_table(self, uv):
+        return np.asarray(uv, float) * 0.001  # 1 px = 1 mm
+
+
+class FakeGuide:
+    """Marks as the overhead marker would give them: the carrot inside the tray's box unless a test moves it."""
+
+    def __init__(self):
+        from dlb.harness.marking import Marks
+
+        self.calibration = {
+            "px_per_cm": 11.9,
+            "rotation_deg": 1.5,
+            "inliers": 8,
+            "pairs": 9,
+            "rms_px": 4.2,
+            "seconds": 22.0,
+            "poses": [{"tcp": [0.21, 0.03], "mark": None, "inlier": False}],
+        }
+        self.pending, self.joined, self.map, self.bin_name = "", 0, FakeMap(), "white tray"
+        self.marks = Marks(
+            points={
+                "carrot": np.array([100.0, 100.0]),
+                "white tray": np.array([100.0, 100.0]),
+                "gripper": None,
+            },
+            spread_px={},
+            latency_s=1.0,
+            boxes={"white tray": np.array([80.0, 80.0, 120.0, 120.0])},
+        )
+        self.marker = SimpleNamespace(mark=lambda img: self.marks)
+
+    def reset(self):
+        pass
+
+    def join(self):
+        from dlb.harness.marking import _Shot
+
+        self.joined += 1
+        self.pending = ""
+        return _Shot("begin", np.zeros(3), self.marks)
 
 
 class FakeAgent:
@@ -561,19 +630,9 @@ class FakeAgent:
     def start_robot(self):
         if self.fail_start:
             raise SystemExit("no objects or no container found on the table")
-        self.env, self.runner = FakeEnv(), FakeRunner()
-        self.guide = SimpleNamespace(
-            calibration={
-                "px_per_cm": 11.9,
-                "rotation_deg": 1.5,
-                "inliers": 8,
-                "pairs": 9,
-                "rms_px": 4.2,
-                "seconds": 22.0,
-                "poses": [{"tcp": [0.21, 0.03], "mark": None, "inlier": False}],
-            },
-            reset=lambda: None,
-        )
+        self.env, self.runner, self.guide = FakeEnv(), FakeRunner(), FakeGuide()
+        self.args.bin_name = self.args.bin_name or "white tray"  # as discover() fills it in
+        self.episode = 0
         self.env.calls.append("start")
 
     def parse(self, text):
@@ -581,11 +640,20 @@ class FakeAgent:
 
     def execute(self, tasks):
         self.executed.append((tasks, self.runner.max_decisions))
-        self.runner.run(0, seed=0, reset=False, keep_marks=True)  # as Agent.execute does
+        self.runner.run(self.episode, seed=0, reset=False, keep_marks=True)  # as Agent.execute does
+        self.episode += 1
+        check = self.runner.held_check
+        if check is not None:  # what the runner's checks would have recorded along the carry
+            check.records.extend(
+                {"where": w, "p_yes": p}
+                for w, p in zip(("grasp", "lift", "travel", "release"), (0.95, 0.9, 0.88, 0.97), strict=True)
+            )
         self.state = self.state.__class__("carrot" if self.env.held else None, self.state.objects, [])
+        self.idle_mark()
 
     def idle_mark(self):
         self.marks += 1
+        self.guide.pending = "begin"
 
 
 @pytest.fixture
@@ -623,6 +691,12 @@ def test_pick_place_starts_the_robot_once_and_runs_the_tasks(fake, ctx, agent):
         and "done: pick carrot, place bin" in r.text
     )
     assert r.data["stop_reason"] == "planner_complete" and "7 decisions" in r.text  # the wrapped runner.run
+    # the visual held check was installed on the runner with the policy's own backend, and the place verified
+    assert a.runner.held_check is not None and a.runner.held_check.be is a.runner.policy.be
+    assert "held confirmed by the wrist camera (4 checks, lowest p 0.88)" in r.text
+    assert "placed, confirmed by the overhead image: the carrot is in the white tray" in r.text
+    assert r.data["verified"] is True and r.data["attempts"] == 1 and a.guide.joined == 1
+    assert a.guide.pending == "begin"  # the idle mark was started again after the one used for the check
     assert ctx.state["task_running"] is False and ctx.state["running_skill"] is None
     # second call: no new agent, same robot
     s.run(ctx, instruction="赤いキューブもお願い")
@@ -689,7 +763,7 @@ def test_pick_place_returns_to_begin_after_teleop(fake, ctx, agent):
     a = agent[0]
     ctx.state["arm_moved_externally"] = True  # teleop happened in between
     s.run(ctx, instruction="y")
-    assert a.env.calls == ["start", "reset"] and a.marks == 1 and "arm_moved_externally" not in ctx.state
+    assert a.env.calls == ["start", "reset"] and "arm_moved_externally" not in ctx.state
 
 
 def test_pick_place_start_failure_closes_the_env(fake, ctx, monkeypatch):
@@ -754,8 +828,9 @@ def test_robot_home_and_release(fake, ctx, agent):
         and "arm_moved_externally" not in ctx.state
     )
     a.state = a.state.__class__("carrot", a.state.objects, [])
+    a.env.calls.clear()
     r = pick_place.RobotRelease().run(ctx)
-    assert r.ok and a.env.calls[-1] == "open" and a.state.held is None
+    assert r.ok and a.env.calls == ["open"] and a.state.held is None
     ctx.state["task_running"] = True
     assert not pick_place.RobotHome().run(ctx).ok and not pick_place.RobotRelease().run(ctx).ok
 
@@ -850,6 +925,14 @@ def test_stop_all_cancels_the_task_and_ends_teleop(fake, ctx):
     assert "pick_place cancelled" in r.text and "tele-operation stopped" in r.text and "holds" in r.text
     ctx.state["task_running"] = False
     assert control.StopAll().run(ctx).text.startswith("nothing was running")
+    # idle + a planned-stop word: the safe stop (nothing to do here: no robot)
+    r = control.StopAll().run(ctx, word="停止して")
+    assert r.text == "safe stop done: nothing was running and no robot was started"
+    assert control.StopAll().run(ctx, word="止まって").text.startswith("nothing was running")
+    # the same word while something runs: the immediate stop
+    ctx.state.update(task_running=True, running_skill=Running())
+    r = control.StopAll().run(ctx, word="停止")
+    assert "pick_place cancelled" in r.text and "holds" in r.text
 
 
 def test_status_line(fake, ctx):
@@ -1008,3 +1091,166 @@ def test_relay_approach_time_follows_the_distance(tmp_path):
     relay.on_follower(JOINTS, [0.0, -0.5, 0.7, 0.6, 0.0])
     relay.on_leader(*leader_msg([1.6, -0.5, 0.7, 0.6, 0.0], 0.3))  # 1.6 rad on joint1
     assert sent[0][2] == pytest.approx(4.0) and relay.t_arrive == pytest.approx(clock.t + 4.5)
+
+
+# ------------------------------------------------------------------ #
+# set-up starts the robot; the place is verified; the safe stop
+# ------------------------------------------------------------------ #
+def test_rig_setup_starts_and_calibrates_the_robot(fake, ctx, agent):
+    fake.http[f"{rig.STT_URL}/health"] = True
+    r = setup.RigSetup().run(ctx)
+    assert r.ok, r.text
+    assert len(agent) == 1 and ctx.robot is agent[0]
+    assert (
+        "the robot: begin pose, overhead calibrated (11.9 px/cm" in r.text and "8 of 9 poses agree" in r.text
+    )
+    assert any("自己校正" in m for m in ctx.said) and r.data["checks"]["robot"] is True
+    # a second set-up does not start it again
+    r = setup.RigSetup().run(ctx)
+    assert len(agent) == 1 and "robot started, overhead calibrated (11.9 px/cm, 8 of 9 poses)" in r.text
+
+
+def test_rig_setup_without_the_robot(fake, ctx, agent):
+    fake.http[f"{rig.STT_URL}/health"] = True
+    r = setup.RigSetup().run(ctx, robot=False)
+    assert agent == [] and ctx.robot is None and "robot" not in r.data["checks"]
+    assert r.ok
+
+
+def test_rig_setup_reports_a_failed_robot_start(fake, ctx, monkeypatch):
+    def build(args):
+        a = FakeAgent(args)
+        a.fail_start = True
+        a.env = FakeEnv()
+        return a
+
+    monkeypatch.setattr(pick_place, "build_agent", build)
+    fake.http = {f"{rig.OPENJEV_URL}/health": True, f"{rig.STT_URL}/health": True}
+    fake.joint_states = True
+    r = setup.RigSetup().run(ctx)
+    assert not r.ok and "robot start failed: could not start the robot: no objects" in r.text
+
+
+def test_pick_place_not_confirmed_retries_once_and_says_so(fake, ctx, agent):
+    s = pick_place.PickPlace()
+    r = s.run(ctx, instruction="x")  # starts the robot; the first task verifies fine
+    a = agent[0]
+    a.guide.marks.points["carrot"] = np.array([150.0, 150.0])  # lies outside the tray's box afterwards
+    a.runner.log_dir = Path(ctx.robot_config).parent
+    ctx.said.clear()
+    r = s.run(ctx, instruction="人参をトレーに入れて")
+    assert not r.ok and r.data["verified"] is False and r.data["attempts"] == 2
+    assert len(a.executed) == 3 and any("もう一度" in m for m in ctx.said)
+    assert r.text.startswith("NOT confirmed: pick carrot, place bin")
+    assert (
+        "the carrot is NOT in the white tray: it lies at (15, 15) cm on the table, 7 cm from the white tray"
+        in r.text
+    )
+    assert "2 attempts" in r.text and "held confirmed by the wrist camera (8 checks" in r.text
+    recs = [json.loads(ln) for ln in (a.runner.log_dir / "ep0002.jsonl").read_text().splitlines()]
+    assert recs[-1]["type"] == "verify" and recs[-1]["ok"] is False and recs[-1]["distance_cm"] == 7.1
+
+
+def test_pick_place_verification_cases(fake, ctx, agent):
+    s = pick_place.PickPlace()
+    s.run(ctx, instruction="x")
+    a = agent[0]
+    # the object is not seen at all: no confirmation, no claim
+    a.guide.marks.points["carrot"] = None
+    r = s.run(ctx, instruction="y")
+    assert (
+        not r.ok and r.data["verified"] is None and "not seen in the overhead image: cannot confirm" in r.text
+    )
+    # a flat place: within 4 cm of the mark counts
+    a.guide.marks.points["carrot"] = np.array([130.0, 100.0])  # 3 cm from the mark (1 px = 1 mm)
+    a.args.flat_place = True
+    r = s.run(ctx, instruction="y")
+    assert r.ok and "the carrot is on the white tray" in r.text
+    a.guide.marks.points["carrot"] = np.array([150.0, 100.0])  # 5 cm: not placed
+    r = s.run(ctx, instruction="y")
+    assert not r.ok and "NOT on the white tray" in r.text and "5 cm from the white tray" in r.text
+    a.args.flat_place = False
+    # put down here: seen on the table is all that can be checked
+    a.answer = a.Intent([{"op": "place", "where": "here"}], True)
+    a.state = a.state.__class__("carrot", a.state.objects, [])
+    r = s.run(ctx, instruction="その場に置いて")
+    assert r.data["verified"] is None  # no pick in the list: nothing to verify
+    a.answer = a.Intent([{"op": "pick", "object": "carrot"}, {"op": "place", "where": "here"}], True)
+    r = s.run(ctx, instruction="z")
+    assert r.ok and "set down here: the carrot is seen on the table" in r.text
+    # the runner gave up: not done, whatever the image says
+    a.runner.stop_reason = "max_decisions"
+    r = s.run(ctx, instruction="z")
+    assert not r.ok and r.text.startswith("NOT done: pick carrot, place here stopped early (max_decisions")
+
+
+def test_safe_stop_sequence_in_order(fake, ctx, agent):
+    pick_place.RobotHome().run(ctx)
+    a = agent[0]
+    a.env.calls.clear()
+    a.env.held = True
+    ctx.processes["follower"], ctx.processes["leader"], ctx.processes["relay"] = (
+        FakePopen(1),
+        FakePopen(2),
+        FakePopen(3),
+    )
+    ctx.state["teleop"] = True
+    ended = []
+
+    class Running(Skill):
+        name = "pick_place"
+
+        def cancel(self, ctx_):
+            ended.append(1)
+            ctx_.state["task_running"] = False  # the task ends after its move in flight
+
+    ctx.state.update(task_running=True, running_skill=Running())
+    ctx.said.clear()
+    r = control.SafeStop().run(ctx)
+    assert r.ok, r.text
+    assert r.data["steps"] == [
+        "pick_place cancelled (ended after its move in flight)",
+        "tele-operation stopped",
+        "gripper opened (the held object was let go)",
+        "arm at the rest pose",
+        "robot released (cameras closed)",
+        "follower driver stopped (torque off)",
+    ]
+    assert ended == [1] and fake.stopped == ["relay", "leader", "follower"] and ctx.robot is None
+    assert a.env.calls == ["open", "go_pose rest", "close"] and a.state.held is None
+    assert [m[:5] for m in ctx.said] == ["作業を止め", "テレオペを", "グリッパー", "アームを休", "フォロワー"]
+    assert r.text.startswith("safe stop done: 1. pick_place cancelled")
+    # nothing left: idempotent
+    assert control.SafeStop().run(ctx).text == "safe stop done: nothing was running and no robot was started"
+
+
+def test_safe_stop_keeps_torque_on_when_the_arm_cannot_rest(fake, ctx, agent):
+    pick_place.RobotHome().run(ctx)
+    a = agent[0]
+    ctx.processes["follower"] = FakePopen(1)
+
+    def go_pose(name):
+        raise RuntimeError("move rested 0.1 rad from its goal")
+
+    a.env.go_pose = go_pose
+    r = control.SafeStop().run(ctx)
+    assert not r.ok and "torque left ON" in r.text and fake.stopped == [] and ctx.robot is a
+    assert ctx.running("follower")
+
+
+def test_safe_stop_gives_up_on_a_task_that_does_not_end(fake, ctx, agent, monkeypatch):
+    pick_place.RobotHome().run(ctx)
+
+    class Stuck(Skill):
+        name = "pick_place"
+
+        def cancel(self, ctx_):
+            pass
+
+    ctx.state.update(task_running=True, running_skill=Stuck())
+    clock = iter(range(0, 100000, 10))
+    monkeypatch.setattr(control.time, "monotonic", lambda: float(next(clock)))
+    r = control.SafeStop().run(ctx)
+    assert (
+        not r.ok and "still running" in r.text and ctx.robot is not None and agent[0].env.calls[-1] == "start"
+    )

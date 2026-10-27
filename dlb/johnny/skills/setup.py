@@ -118,6 +118,24 @@ def check_services(ctx: Context, cfg: dict[str, Any]) -> list[Check]:
     ]
 
 
+def robot_check(ctx: Context) -> Check:
+    """Started (begin pose, overhead calibrated) or not: pick_place can only start right away when it is."""
+    agent = ctx.robot
+    if agent is None:
+        return Check(
+            "robot", False, "robot not started (rig_setup starts it: begin pose + overhead calibration)"
+        )
+    cal = getattr(getattr(agent, "guide", None), "calibration", None) or {}
+    if cal:
+        return Check(
+            "robot",
+            True,
+            f"robot started, overhead calibrated ({cal.get('px_per_cm')} px/cm, {cal.get('inliers')} of "
+            f"{cal.get('pairs')} poses)",
+        )
+    return Check("robot", True, "robot started")
+
+
 def summarize(checks: list[Check], started: list[str]) -> str:
     ok = [c.text for c in checks if c.ok]
     bad = [c.text for c in checks if c.ok is False]
@@ -173,7 +191,7 @@ class RigStatus(Skill):
 
     def run(self, ctx: Context, deep: bool = False, **_: Any) -> SkillResult:
         cfg = rig.load_config(ctx.robot_config)
-        checks = [*check_cameras(cfg, ctx), check_arms(ctx, cfg), *check_services(ctx, cfg)]
+        checks = [*check_cameras(cfg, ctx), check_arms(ctx, cfg), *check_services(ctx, cfg), robot_check(ctx)]
         extra: dict[str, Any] = {}
         if deep and not ctx.state.get("task_running"):
             r = rig.run([sys.executable, "-m", "dlb.cli", "smoke", "--backend", "openjev"], timeout=90)
@@ -206,7 +224,9 @@ class RigSetup(Skill):
         "Set the rig up: check everything (as rig_status) and start what is missing: the ROS 2 follower arm "
         "driver (torque on, the arm holds its pose), the openjev decision server (Docker; healthy after 1-3 min), "
         "the speech-to-text server. Use for 'set up the robot', 'ロボットのセットアップして', 'start everything', "
-        "'ドライバを起動して'. Does not move the arm. Cameras that give no frame become an instruction for the user."
+        "'ドライバを起動して'. Then, by default, it also starts the robot: the arm moves to the begin pose and around it "
+        "for ~25 s to calibrate the overhead camera (so pick_place can start right away); robot=false skips "
+        "that. Cameras that give no frame become an instruction for the user."
     )
     parameters = {
         "type": "object",
@@ -215,12 +235,17 @@ class RigSetup(Skill):
                 "type": "array",
                 "items": {"type": "string", "enum": list(SERVICES)},
                 "description": "What to start when missing: follower (arm driver), openjev, stt. Default: all.",
-            }
+            },
+            "robot": {
+                "type": "boolean",
+                "description": "Also start the robot (begin pose + overhead calibration, the arm moves) once the "
+                "services are up. Default true.",
+            },
         },
         "additionalProperties": False,
     }
 
-    def run(self, ctx: Context, start: list[str] | None = None, **_: Any) -> SkillResult:
+    def run(self, ctx: Context, start: list[str] | None = None, robot: bool = True, **_: Any) -> SkillResult:
         cfg = rig.load_config(ctx.robot_config)
         want = set(start or SERVICES)
         started: list[str] = []
@@ -233,6 +258,8 @@ class RigSetup(Skill):
         if "stt" in want and not rig.stt_ok():
             started.append(self._start_stt())
         checks.extend(check_services(ctx, cfg))
+        if robot:
+            checks.append(self._start_robot(ctx, checks, started))
         extra: dict[str, Any] = {"robot_started": ctx.robot is not None}
         if ctx.state.get("cameras_changed"):
             checks.append(
@@ -247,6 +274,33 @@ class RigSetup(Skill):
         if any("openjev" in s for s in started):
             res.text += " openjev takes 1-3 min to become healthy: check again with rig_status later."
         return res
+
+    @staticmethod
+    def _start_robot(ctx: Context, checks: list[Check], started: list[str]) -> Check:
+        """Start the robot (begin pose + ~22 s overhead calibration) once the services it needs are up."""
+        if ctx.robot is not None:
+            return robot_check(ctx)
+        ready = {c.name: c.ok for c in checks}
+        missing = [n for n in ("follower", "openjev", "openai") if not ready.get(n)]
+        if missing:
+            return Check(
+                "robot",
+                False,
+                f"robot not started yet ({', '.join(missing)} not ready); the next rig_setup, calibrate_overhead "
+                "or pick_place starts it",
+            )
+        from dlb.johnny.skills.calibrate import describe
+        from dlb.johnny.skills.pick_place import ensure_robot
+
+        agent, err = ensure_robot(ctx)
+        if agent is None:
+            return Check("robot", False, f"robot start failed: {err}")
+        started.append(
+            "the robot: begin pose, overhead calibrated ("
+            + describe(getattr(agent.guide, "calibration", None))
+            + ")"
+        )
+        return robot_check(ctx)
 
     @staticmethod
     def _start_openjev() -> str:
@@ -274,9 +328,10 @@ class RigSetup(Skill):
 class RigShutdown(Skill):
     name = "rig_shutdown"
     description = (
-        "Shut the rig down: stop tele-operation and the follower arm driver (torque off: hold the arm or let it "
-        "rest first), release the robot, and optionally stop the openjev and STT Docker containers. Use for "
-        "'shut down', '終了して', '電源を落とす前に止めて'. Not for 'stop' during a task (use stop_all)."
+        "Shut the rig down (same as safe_stop: gripper open, rest pose, release the robot, follower driver "
+        "torque off with the arm resting), and optionally stop the openjev and STT Docker containers. "
+        "Use for 'shut down the rig', '電源を落とす前に止めて', 'リグを落として'. Not for 'stop' during a task "
+        "(use stop_all)."
     )
     parameters = {
         "type": "object",
@@ -290,24 +345,10 @@ class RigShutdown(Skill):
     }
 
     def run(self, ctx: Context, docker: bool = False, **_: Any) -> SkillResult:
-        done: dict[str, Any] = {}
-        running = ctx.state.get("running_skill")
-        if ctx.state.get("task_running") and running is not None:
-            running.cancel(ctx)
-            done["task"] = "cancelled"
-        done["leader"] = rig.stop(ctx, "leader")
-        ctx.state["teleop"] = False
-        if ctx.robot is not None:
-            try:
-                ctx.robot.env.close()
-            except Exception as e:  # noqa: BLE001 - shutting down anyway
-                ctx.log(f"robot close: {e}")
-            ctx.robot = None
-            done["robot"] = "released"
-        if ctx.running("follower"):
-            ctx.say("フォロワーのドライバを止めます。トルクが切れるのでアームを支えてください。")
-        done["follower"] = rig.stop(ctx, "follower")
-        if docker:
-            done["docker"] = rig.docker_stop(["openjev", "stt"])
-        text = "; ".join(f"{k}: {v}" for k, v in done.items() if v != "not running") or "nothing was running"
-        return SkillResult(f"shut down: {text}.", data=done)
+        from dlb.johnny.skills.control import safe_stop_sequence
+
+        steps, ok = safe_stop_sequence(ctx, docker)
+        text = "; ".join(steps) or "nothing was running"
+        return SkillResult(
+            ("shut down: " if ok else "shutdown INCOMPLETE: ") + text + ".", ok=ok, data={"steps": steps}
+        )
