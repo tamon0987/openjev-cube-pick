@@ -9,12 +9,13 @@ and then forwards the stream with a velocity limit.
     ros2 launch dlb/johnny/launch/omx_l_leader_relay.launch.py port_name:=/dev/ttyACM1
 """
 
-from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import SetRemap
 from launch_ros.substitutions import FindPackageShare
+
+from launch import LaunchDescription
 
 
 def generate_launch_description():
