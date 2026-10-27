@@ -12,7 +12,7 @@ gripper_joint: gripper_joint_1
 gripper_open: 0.45
 gripper_closed: 0.0
 # A closed command that stops more than this far from gripper_closed means the fingers hold something.
-gripper_held_margin: 0.08
+gripper_held_margin: 0.03  # was 0.08 (~1.2 cm): a ~1 cm pen read as "nothing held" and was let go (2026-10-28)
 
 # Tool pitch below horizontal for every IK solve: "begin" keeps the begin pose's pitch (as Show-Harness does), or
 # a number of degrees (90 = straight down). The wrist camera model (calib_wrist.yaml) holds at any pitch.
