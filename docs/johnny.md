@@ -68,3 +68,7 @@ MUJOCO_GL=egl .venv/bin/python -m pytest -q tests/test_johnny.py
 ```
 
 ネットワークもロボットも要りません。ウェイクワードの判定表、履歴の切り詰めと保存、スタブの LLM での tool ループ、止める言葉での取り消し、二段階の対話スキルを確かめます。テスト用の偽スキルは `tests/test_johnny.py` の中にあります（`dlb/johnny/skills/` には置きません）。
+
+## スキル一覧
+
+用意されているスキル（セットアップ、カメラ・アームの特定、テレオペ、把持、較正、停止）と、その使い方は [johnny_skills.md](johnny_skills.md) にあります。

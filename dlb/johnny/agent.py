@@ -192,7 +192,7 @@ class Johnny:
                     s.cancel(self.ctx)
                 except Exception as e:  # noqa: BLE001
                     self.log(f"cancel {s.name} failed: {e}")
-        stop_skill = self.skills.get("stop")
+        stop_skill = self.skills.get("stop_all") or self.skills.get("stop")  # control.py names it stop_all
         text = STOPPED_REPLY
         if stop_skill is not None and stop_skill not in (running, asking):
             try:
