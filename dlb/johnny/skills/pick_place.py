@@ -1,9 +1,17 @@
 """Pick and place by voice: the instruction goes through ``dlb.voice.agent.Agent`` (intent parser -> tasks ->
-two-tier runner with the overhead guide and the Jev servo).
+two-tier runner with the overhead guide and the Jev servo), and the outcome is verified before it is reported.
 
 The Agent (and with it the RealOMX bridge, the cameras, the one openjev client) is built on the first robot
-skill and kept in ``ctx.robot``; starting it moves the arm to the begin pose and runs the ~22 s overhead
-self-calibration. ``robot_home`` and ``robot_release`` are the small moves one asks for by voice.
+skill -- ``rig_setup`` by default -- and kept in ``ctx.robot``; starting it moves the arm to the begin pose and
+runs the ~22 s overhead self-calibration. ``robot_home`` and ``robot_release`` are the small moves one asks for
+by voice.
+
+Verification (a cube once slipped right after the lift while the gripper reading said "closed on object", and
+the robot reported done): the runner gets a ``held_check`` (``JevHeldCheck``: the wrist image, one yes/no question
+to Jev, ~0.4 s) that runs after the grasp, after the lift, after the level travel and right before the release;
+a failed check aborts the carry and the pick starts over where the object lies now. After the task one fresh
+overhead mark (the idle mark that starts anyway) must show the object inside the place's box (a flat place:
+within 4 cm of its mark); otherwise the result says so (ok=False) after one retry of the whole task.
 
 Cancel: the runner has no cancel hook, so ``cancel`` zeroes its decision and planner budgets -- it stops at the
 next decision (an in-flight move, or a guided approach / place in progress, finishes first) and the arm holds
@@ -13,16 +21,21 @@ where it is.
 from __future__ import annotations
 
 import argparse
+import json
 import threading
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
+
+import numpy as np
 
 from dlb.johnny.skills import rig
 from dlb.johnny.skills.base import Context, Skill, SkillResult
 from dlb.johnny.skills.teleop import stop_teleop, teleop_running
 
 NOT_HEALTHY = "openjev がまだ起動中です（あと1〜3分）。少し待ってからもう一度言ってください。"
+VERIFY_RETRIES = 1  # the whole task once more when the overhead image does not show the object in its place
+FLAT_TOL_M = 0.04  # a flat place: the object counts as placed within this distance of the place's mark
 
 
 def agent_args(ctx: Context, objects: list[str] | None, place: str, flat_place: bool) -> argparse.Namespace:
@@ -64,8 +77,10 @@ def ensure_robot(
     if not rig.openai_key(ctx.env_file):
         return None, "OPENAI_API_KEY is not set (.env): the instruction parser and the overhead marks need it"
     if not rig.openjev_ok():
-        return None, NOT_HEALTHY if rig.docker_state("openjev") == "running" else (
-            "openjev is not running: rig_setup starts it (healthy after 1-3 min)"
+        return None, (
+            NOT_HEALTHY
+            if rig.docker_state("openjev") == "running"
+            else "openjev is not running: rig_setup starts it (healthy after 1-3 min)"
         )
     if not rig.follower_running(ctx, cfg):
         ctx.say("フォロワーのドライバを起動します。")
@@ -89,6 +104,7 @@ def ensure_robot(
             raise
         return None, f"could not start the robot: {e}"
     _record_results(agent)
+    install_held_check(agent)
     ctx.robot = agent
     ctx.state.pop("arm_moved_externally", None)
     ctx.log(f"robot started: objects {agent.objects}, place {agent.args.bin_name!r}")
@@ -110,6 +126,18 @@ def _record_results(agent: Any) -> None:
     runner.run, runner._johnny_wrapped = run, True
 
 
+def install_held_check(agent: Any) -> Any:
+    """The visual held check on the runner, with the policy's own Jev client (never a second one)."""
+    runner = agent.runner
+    be = getattr(getattr(runner, "policy", None), "be", None)
+    if runner is None or be is None:
+        return None
+    from dlb.harness.twotier import JevHeldCheck
+
+    runner.held_check = JevHeldCheck(be)
+    return runner.held_check
+
+
 def return_to_begin(ctx: Context, agent: Any) -> None:
     """After tele-operation the arm is anywhere: back to the begin pose, gripper open, marks afresh."""
     if ctx.state.pop("arm_moved_externally", False):
@@ -127,16 +155,120 @@ def leave_teleop(ctx: Context) -> str:
     return ""
 
 
+# ------------------------------------------------------------------ #
+# verification of the place by the overhead image
+# ------------------------------------------------------------------ #
+@dataclass
+class Verification:
+    ok: bool | None  # True: seen in its place; False: seen elsewhere; None: could not tell
+    text: str
+    record: dict[str, Any]
+
+
+def _inside(pt: np.ndarray, box: np.ndarray | None) -> bool:
+    return box is not None and bool(box[0] <= pt[0] <= box[2] and box[1] <= pt[1] <= box[3])
+
+
+def verify_place(agent: Any, tasks: list[dict[str, str]]) -> Verification | None:
+    """After the runner returned to the begin pose: does one fresh overhead mark show the last picked object in
+    its place? Uses the idle mark the agent starts after every task (and starts the next one afterwards).
+    None when the task list does not end with a place."""
+    if not tasks or tasks[-1].get("op") != "place":
+        return None
+    picks = [t["object"] for t in tasks if t.get("op") == "pick" and t.get("object")]
+    guide, env = agent.guide, agent.env
+    if not picks or guide is None:
+        return None
+    obj, where = picks[-1], tasks[-1].get("where") or "bin"
+    place = agent.args.bin_name if where == "bin" else where.removeprefix("on:")
+    flat = where == "bin" and bool(getattr(agent.args, "flat_place", False))
+    rec: dict[str, Any] = {"type": "verify", "object": obj, "where": where, "place": place}
+    t0 = time.perf_counter()
+    try:
+        shot = guide.join() if guide.pending else None
+        marks = shot.marks if shot is not None else guide.marker.mark(env.overhead_frame())
+    except Exception as e:  # noqa: BLE001 - no mark, no verdict
+        rec.update(ok=None, reason=f"marking failed: {e}")
+        _log_verify(agent, rec)
+        return Verification(None, f"could not verify the place (the overhead mark failed: {e})", rec)
+    rec["seconds"] = round(time.perf_counter() - t0, 1)
+    pt = marks.points.get(obj)
+    rec["object_px"] = None if pt is None else np.round(pt, 1).tolist()
+    if where == "here":
+        ok = pt is not None
+        text = (
+            f"set down here: the {obj} is {'seen on the table' if ok else 'NOT seen in the overhead image'}"
+        )
+    elif pt is None:
+        ok = None
+        text = f"placed, but the {obj} is not seen in the overhead image: cannot confirm it is in the {place}"
+    else:
+        box, ppt = marks.boxes.get(place), marks.points.get(place)
+        rec["place_box_px"] = None if box is None else np.round(box, 1).tolist()
+        dist = None
+        if ppt is not None and getattr(guide.map, "ready", False):
+            dist = float(np.linalg.norm(guide.map.to_table(pt) - guide.map.to_table(ppt)))
+            rec["distance_cm"] = round(dist * 100, 1)
+        if flat:
+            ok = dist is not None and dist <= FLAT_TOL_M
+        else:
+            ok = _inside(pt, box) if box is not None else (dist is not None and dist <= FLAT_TOL_M)
+        if ok:
+            text = (
+                f"placed, confirmed by the overhead image: the {obj} is {'on' if flat else 'in'} the {place}"
+            )
+        else:
+            lies = ""
+            if getattr(guide.map, "ready", False):
+                xy = guide.map.to_table(pt)
+                lies = f"it lies at ({xy[0] * 100:.0f}, {xy[1] * 100:.0f}) cm on the table"
+                if dist is not None:
+                    lies += f", {dist * 100:.0f} cm from the {place}"
+            text = f"placed, but the {obj} is NOT {'on' if flat else 'in'} the {place}" + (
+                f": {lies}" if lies else ""
+            )
+    rec.update(ok=ok, text=text)
+    _log_verify(agent, rec)
+    agent.idle_mark()  # the mark was consumed: start the next one so the next instruction finds a fresh one
+    return Verification(ok, text, rec)
+
+
+def _log_verify(agent: Any, rec: dict[str, Any]) -> None:
+    """Append the verdict to the episode log the runner wrote (``ep<n>.jsonl``)."""
+    log_dir = getattr(agent.runner, "log_dir", None)
+    if not log_dir:
+        return
+    try:
+        with open(log_dir / f"ep{max(0, agent.episode - 1):04d}.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def held_summary(agent: Any) -> tuple[str, dict[str, Any]]:
+    check = getattr(agent.runner, "held_check", None)
+    records = list(getattr(check, "records", []) or [])
+    if not records:
+        return "no visual held check", {"held_checks": 0}
+    lowest = min(r["p_yes"] for r in records)
+    return (
+        f"held confirmed by the wrist camera ({len(records)} checks, lowest p {lowest:.2f})",
+        {"held_checks": len(records), "held_lowest_p": lowest},
+    )
+
+
 class PickPlace(Skill):
     name = "pick_place"
     description = (
         "Have the robot arm pick objects on the table and place them (into the container, on another object, or "
         "put down where it is), from the user's own words: 'put the carrot in the tray', '人参をトレーに入れて', "
-        "'赤いのをビンに', 'それを青いキューブの上に', 'その場に置いて'. Pass the instruction as said. The first "
-        "call starts the robot (begin pose + ~30 s camera self-calibration); the objects and the container are "
-        "found in the overhead image unless given. Blocks until the task ends; if the instruction is ambiguous "
-        "the result is a question to ask the user (ok=false, data.clarify). Not while tele-operation runs "
-        "(it is stopped first) or another task runs."
+        "'赤いのをビンに', 'それを青いキューブの上に', 'その場に置いて'. Pass the instruction as said. Starts the "
+        "robot first when rig_setup did not (begin pose + ~30 s camera self-calibration); the objects and the "
+        "container are found in the overhead image unless given. Blocks until the task ends. The grasp is checked "
+        "with the wrist camera along the carry and the place with the overhead image afterwards: ok=false with "
+        "data.verified=false means the object is NOT where it should be -- never report success then. If the "
+        "instruction is ambiguous the result is a question to ask the user (ok=false, data.clarify). Not while "
+        "tele-operation runs (it is stopped first) or another task runs."
     )
     parameters = {
         "type": "object",
@@ -205,10 +337,26 @@ class PickPlace(Skill):
         ctx.state["task_running"], ctx.state["running_skill"] = True, self
         runner = agent.runner
         budgets = (runner.max_decisions, runner.max_planner_calls)
+        check = getattr(runner, "held_check", None)
+        if check is not None and hasattr(check, "records"):
+            check.records.clear()
+        attempts, verdict, r = 0, None, None
         try:
             return_to_begin(ctx, agent)
             ctx.say("実行します。")
-            agent.execute(intent.tasks)
+            while True:
+                attempts += 1
+                agent.execute(intent.tasks)
+                r = getattr(agent, "last_result", None)
+                complete = getattr(r, "stop_reason", "") == "planner_complete"
+                verdict = (
+                    verify_place(agent, intent.tasks) if complete and not self._cancel.is_set() else None
+                )
+                if self._cancel.is_set() or not complete or verdict is None or verdict.ok is True:
+                    break
+                if attempts > VERIFY_RETRIES:
+                    break
+                ctx.say("置けていないので、もう一度やります。")
         except Exception as e:  # noqa: BLE001 - a failed motion leaves the arm where it is
             return SkillResult(
                 prefix + f"the task failed: {e}; the arm holds where it is",
@@ -218,8 +366,9 @@ class PickPlace(Skill):
         finally:
             runner.max_decisions, runner.max_planner_calls = budgets
             ctx.state["task_running"], ctx.state["running_skill"] = False, None
-        r = getattr(agent, "last_result", None)
         held = agent.state.held
+        held_text, held_data = held_summary(agent)
+        complete = getattr(r, "stop_reason", "") == "planner_complete"
         data = {
             "tasks": intent.tasks,
             "held": held,
@@ -227,6 +376,10 @@ class PickPlace(Skill):
             "stop_reason": getattr(r, "stop_reason", ""),
             "decisions": getattr(r, "decisions", None),
             "missed_grasps": getattr(r, "missed_grasps", None),
+            "drops": getattr(r, "drops", None),
+            "attempts": attempts,
+            "verified": None if verdict is None else verdict.ok,
+            **held_data,
         }
         if self._cancel.is_set():
             return SkillResult(
@@ -234,9 +387,26 @@ class PickPlace(Skill):
                 data=data,
             )
         done = ", ".join(f"{t['op']} {t.get('object') or t.get('where')}" for t in intent.tasks)
+        stats = (
+            f"{data['decisions']} decisions, {data['missed_grasps']} missed grasps, {data['drops'] or 0} drops"
+            + (f", {attempts} attempts" if attempts > 1 else "")
+        )
+        if not complete:
+            return SkillResult(
+                prefix + f"NOT done: {done} stopped early ({data['stop_reason'] or 'unknown'}; {stats}); "
+                f"{held_text}; holding {held or 'nothing'}",
+                ok=False,
+                data=data,
+            )
+        if verdict is None:
+            return SkillResult(
+                prefix + f"done: {done} ({stats}); {held_text}; holding {held or 'nothing'}", data=data
+            )
+        ok = verdict.ok is True
         return SkillResult(
-            prefix + f"done: {done} ({data['stop_reason'] or 'finished'}, {data['decisions']} decisions, "
-            f"{data['missed_grasps']} missed grasps); holding {held or 'nothing'}",
+            prefix + f"{'done' if ok else 'NOT confirmed'}: {done} ({stats}); {held_text}; {verdict.text}; "
+            f"holding {held or 'nothing'}",
+            ok=ok,
             data=data,
         )
 

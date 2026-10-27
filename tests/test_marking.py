@@ -433,7 +433,7 @@ def test_goto_refuses_an_object_inside_the_bin():
 
 
 def test_flat_place_sets_the_object_down():
-    from dlb.harness.twotier import PLACE_Z_MARGIN, RELEASE_Z, Z_GRASP, Subtask
+    from dlb.harness.twotier import PLACE_Z_MARGIN, RELEASE_Z, TRANSPORT_Z, Z_GRASP, Subtask
 
     class G:  # a guide that is already above the place
         bin_name, container = "red cross mark", False
@@ -465,12 +465,16 @@ def test_flat_place_sets_the_object_down():
         return env.calls
 
     low = round(Z_GRASP + PLACE_Z_MARGIN, 4)
+    # straight up to the transport height (the held check looks there), level travel (the guide), down to the
+    # release height (another look), then: set down and clear of it / dropped in from the release height
     assert place(False) == [
+        ("z", TRANSPORT_Z),
+        ("z", RELEASE_Z),
         ("z", low),
         ("open", low),
         ("z", round(low + 0.03, 4)),
-    ]  # set down, then clear of it
-    assert place(True) == [("open", RELEASE_Z)]  # a bin: dropped in from the release height
+    ]
+    assert place(True) == [("z", TRANSPORT_Z), ("z", RELEASE_Z), ("open", RELEASE_Z)]
 
 
 def test_pick_target_keeps_its_marked_centre_whatever_it_is_called():

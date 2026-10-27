@@ -14,15 +14,16 @@ Johnny（`dlb/johnny/`）は、ウェイクワードのあとの発話を LLM（
 | スキル | 引数 | すること |
 |---|---|---|
 | `rig_status` | `deep` | 見るだけ。カメラ 2 台（画像が来るか）、アームの USB ポート、フォロワーのドライバ、openjev、文字起こしサーバー、`OPENAI_API_KEY`。`deep=true` で `dlb smoke --backend openjev` も実行 |
-| `rig_setup` | `start`（`follower` / `openjev` / `stt` の配列、既定は全部） | 確認して、足りないものを起動する。アームは動かさない |
-| `rig_shutdown` | `docker` | テレオペとフォロワーのドライバを止め（トルクが切れる）、ロボットを解放。`docker=true` で openjev と stt のコンテナも停止 |
+| `rig_setup` | `start`（`follower` / `openjev` / `stt` の配列、既定は全部）、`robot`（既定 true） | 確認して、足りないものを起動し、サービスがそろっていれば**ロボットも起動する**（はじめの姿勢 + 約 22 秒の俯瞰カメラ自己校正。アームが動く前に `ctx.say` で知らせる）。openjev がまだ起動中なら、その旨を返し、次の `rig_setup` / `calibrate_overhead` / `pick_place` が起動する |
+| `rig_shutdown` | `docker` | `safe_stop` と同じ手順（下記）。`docker=true` で openjev と stt のコンテナも停止 |
 | `identify_cameras` | `step`, `rotate` | どの USB カメラが手首/俯瞰かを、ユーザーに 1 台ずつ抜いてもらって特定し、設定に書く（対話式、下記） |
 | `identify_arms` | `step` | どのポートがフォロワー/リーダーかを、リーダーの USB を抜いてもらって特定（対話式） |
 | `teleop_start` / `teleop_stop` / `teleop_status` | なし | リーダーアーム（OMX-L）でフォロワーを動かす |
-| `pick_place` | `instruction`, `objects`, `place`, `flat_place` | 発話をそのまま渡す。初回にロボットを起動（はじめの姿勢 + 約 22 秒の俯瞰カメラ自己校正）し、`dlb.voice.agent.Agent` で解釈・実行 |
+| `pick_place` | `instruction`, `objects`, `place`, `flat_place` | 発話をそのまま渡す。ロボットが未起動なら起動し、`dlb.voice.agent.Agent` で解釈・実行。把持は手首カメラで、置けたかは俯瞰画像で**確認してから**報告する（下記） |
 | `robot_home` / `robot_release` | なし | はじめの姿勢へ / グリッパーを開く（ロボット未起動なら起動する） |
 | `calibrate_overhead` | なし | 俯瞰カメラの自己校正をやり直す（カメラを動かした・替えたとき） |
-| `stop_all` | なし | 実行中のタスクをキャンセルし、テレオペを止める。アームはその場で保持 |
+| `stop_all` | `word`（任意） | **即時停止**（「止まって」「ストップ」）: 実行中のタスクをキャンセルし、テレオペを止める。アームはその場で保持。何も動いていないときに `word` が「停止」「終了」なら `safe_stop` を実行 |
+| `safe_stop` | `docker` | **計画的な停止**（「停止して」「終了して」「今日は終わり」）: タスク中止 → テレオペ停止 → グリッパーを開く → 休止姿勢へゆっくり → ロボット解放 → フォロワーのドライバ停止（アームが休んだ状態でトルクが切れる） |
 | `status` | なし | 1 行の現状（安い） |
 
 結果の `text` は LLM 向けの短い英語、ユーザーに手を動かしてもらう指示（`data.ask_user = true`）は日本語で、LLM がそのまま伝えます。
@@ -137,6 +138,55 @@ joint2 が -1.86 rad まで飛び、ID 13 / 15 が過負荷エラーになりま
    `max_planner_calls` を 0 にします。次の判断（または次のプランナー呼び出し）で止まり、**進行中の 1 動作（俯瞰ガイド
    の接近や置く動作の途中なら、その小タスク）は最後まで動きます**。アームはその場で保持。終わったら予算を元に戻します。
    `ctx.state["task_running"]` / `["running_skill"]` が実行中の印です。
+
+## 把持と置いたことの確認（`pick_place`）
+
+緑のキューブが持ち上げた直後に滑り落ち、グリッパーの読み値は「閉じて何かを握っている」のまま、ロボットが「完了」と
+言ったことがありました。グリッパーの読み値だけで「持っている」と判断することはもうしません。
+
+- **把持の確認**（`TwoTierRunner.held_check`、`dlb/harness/twotier.py`）: ランナーに `held_check(env, images, where)
+  -> (held, p_yes)` という呼び出し可能オブジェクトを差し込めます（既定 None = シミュレーション: グリッパー/溶接の
+  真値をそのまま使う）。実機では `ensure_robot` が `JevHeldCheck(policy.be)`（ポリシーと同じ openjev クライアント、
+  2 つ目は作らない）を差し込みます。手首画像に Noul（はい/いいえ）を 1 問、「Is the <object> held between the
+  gripper fingers right now (not lying on the table below)?」、約 0.4 秒。
+  - 呼ぶ場所: **GRASP の直後**（`grasp`）、**持ち上げて搬送高さに着いたとき**（`lift`）、**水平移動のあと、降ろす前**
+    （`travel`）、**放す直前**（`release`）。「ここに置く」（`here`）は搬送がないので `grasp` だけ。
+  - 「持っていない」と出たら: `grasp` ならこれまでの空振り（missed_grasp）と同じ扱い。搬送中なら**搬送を中止**
+    （ビンの上では放さない）: グリッパーを開いてホバー高さへ上がり、俯瞰マークをバックグラウンドで取り直し、
+    プランナーはそのピックからやり直す（`TaskPlanner.restart_index`。物体は落ちた先で見つかる）。1 ピックあたり
+    `retries`（2）回まで。
+  - ログ: エピソードログに `held_check` レコード（where、held、p_yes、latency、手首画像）と、中止したときは
+    `outcome: dropped` のイベント。`TwoTierResult.drops` / `held_checks`。
+- **置いたことの確認**（`verify_place`、`dlb/johnny/skills/pick_place.py`）: タスク列が「置く」で終わるとき、
+  ランナーがはじめの姿勢に戻ったあとに始まるアイドルマーク（`Agent.idle_mark`）を `guide.join()` で待ち、その
+  俯瞰マークで最後にピックした物体の点が置き場所の箱（`Marks.boxes[place]`）の中にあるかを見ます。
+  `--flat-place` のときは置き場所のマークから 4 cm 以内（`guide.map` でテーブル座標に直して距離を出す）。
+  `here` は物体が見えていれば可。箱がなければ距離で判定。物体が見えなければ「確認できない」。
+  使ったマークの代わりに `idle_mark()` をもう一度始めるので、次の指示は新しいマークから始まります。
+  結果が「置けていない」なら、`ctx.say`「置けていないので、もう一度やります。」のあと**タスク列を 1 回だけ
+  やり直し**（`VERIFY_RETRIES = 1`）、それでも駄目なら `ok=False`、`data.verified = False`、
+  `text = "NOT confirmed: ...; placed, but the green cube is NOT in the tray: it lies at (15, 15) cm on the table,
+  7 cm from the tray"` で返します（LLM は「完了」と言ってはいけない、と説明文に明記）。エピソードログに
+  `verify` レコードを追記します。
+- 結果の文には何を確認したかを書きます: `held confirmed by the wrist camera (4 checks, lowest p 0.88); placed,
+  confirmed by the overhead image: the green cube is in the tray`。ランナーが途中で止まったとき
+  （`stop_reason != planner_complete`）は `NOT done: ...` で `ok=False`。
+- 追加の時間: 把持確認は 1 回約 0.4 秒 × 4 回 ≈ 2 秒、置いたことの確認はアイドルマーク（gpt-5.5、約 5〜8 秒）
+  を待つ分。やり直しが起きたときは 1 タスク分（約 45 秒）が加わります。
+
+## 安全停止（`safe_stop`）と即時停止（`stop_all`）
+
+- `stop_all`（「止まって」「ストップ」、コアがウェイクワードなしの停止語で LLM を介さず呼ぶ）: タスクのキャンセル
+  （進行中の 1 動作が終わってから止まる）とテレオペの停止だけ。アームはその場で保持。
+- `safe_stop`（「停止して」「終了して」「今日は終わり」「ロボットを止めて」）: 順に (1) 実行中のタスクをキャンセルし、
+  終わるまで待つ（最大 90 秒）、(2) テレオペ停止（中継 → リーダー launch）、(3) ロボットが起動していればグリッパーを
+  開く（持っていた物はその場に落ちる。アームは高くない）、(4) `env.go_pose("rest")`（設定に `poses.rest` がなければ
+  `begin`）へゆっくり、(5) `env.close()`（カメラ解放、`ctx.robot = None`）とフォロワー launch への SIGINT（アームが
+  休んだ状態でトルクが切れる）。openjev と STT は `docker=true` のときだけ止めます。各ステップを `ctx.say` で
+  伝え、結果の文に順番に並べます。アームの移動に失敗したら、トルクは切らずにそこで止めて `ok=False`。
+- 「停止」は現在コアの STOP_WORDS にあり、`stop_all` が LLM なしで呼ばれます。`stop_all` に `word`（聞こえた停止語）
+  を渡してもらえば、何も動いていないときの「停止」「終了」は `safe_stop` に回し、動いているときは即時停止のままに
+  します（`control.is_safe_word`）。
 
 ## 校正（`calibrate_overhead`）
 
