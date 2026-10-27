@@ -1,0 +1,128 @@
+# Johnny のスキル
+
+Johnny（`dlb/johnny/`）は、ウェイクワードのあとの発話を LLM（gpt-5.5、ツール呼び出し）が受け取り、リグへの操作を
+**スキル**として呼び出す音声エージェントです。このページはスキル側（`dlb/johnny/skills/*.py`）の説明です。
+インターフェースは `dlb/johnny/skills/base.py`（`Skill` の `name` / `description` / `parameters` / `run(ctx, **kwargs)` /
+`cancel(ctx)`、共有状態の `Context`）で、レジストリが `dlb.johnny.skills` 配下の全モジュールを読み込み、
+`Skill` のサブクラスを引数なしで生成します。
+
+```
+発話 ─▶ LLM ─▶ スキル（run）─▶ SkillResult.text（LLM に返る）─▶ ユーザーへの返事
+                              └─ ctx.say(...)：動く前の注意など、LLM を介さずすぐ伝える
+```
+
+| スキル | 引数 | すること |
+|---|---|---|
+| `rig_status` | `deep` | 見るだけ。カメラ 2 台（画像が来るか）、アームの USB ポート、フォロワーのドライバ、openjev、文字起こしサーバー、`OPENAI_API_KEY`。`deep=true` で `dlb smoke --backend openjev` も実行 |
+| `rig_setup` | `start`（`follower` / `openjev` / `stt` の配列、既定は全部） | 確認して、足りないものを起動する。アームは動かさない |
+| `rig_shutdown` | `docker` | テレオペとフォロワーのドライバを止め（トルクが切れる）、ロボットを解放。`docker=true` で openjev と stt のコンテナも停止 |
+| `identify_cameras` | `step`, `rotate` | どの USB カメラが手首/俯瞰かを、ユーザーに 1 台ずつ抜いてもらって特定し、設定に書く（対話式、下記） |
+| `identify_arms` | `step` | どのポートがフォロワー/リーダーかを、リーダーの USB を抜いてもらって特定（対話式） |
+| `teleop_start` / `teleop_stop` / `teleop_status` | なし | リーダーアーム（OMX-L）でフォロワーを動かす |
+| `pick_place` | `instruction`, `objects`, `place`, `flat_place` | 発話をそのまま渡す。初回にロボットを起動（はじめの姿勢 + 約 22 秒の俯瞰カメラ自己校正）し、`dlb.voice.agent.Agent` で解釈・実行 |
+| `robot_home` / `robot_release` | なし | はじめの姿勢へ / グリッパーを開く（ロボット未起動なら起動する） |
+| `calibrate_overhead` | なし | 俯瞰カメラの自己校正をやり直す（カメラを動かした・替えたとき） |
+| `stop_all` | なし | 実行中のタスクをキャンセルし、テレオペを止める。アームはその場で保持 |
+| `status` | なし | 1 行の現状（安い） |
+
+結果の `text` は LLM 向けの短い英語、ユーザーに手を動かしてもらう指示（`data.ask_user = true`）は日本語で、LLM がそのまま伝えます。
+
+## セットアップの確認（`rig_status` / `rig_setup`）
+
+確認する項目と、足りないときの扱い:
+
+- **カメラ**: `configs/robot/omx_f.yaml` の `cameras.wrist.device` / `cameras.front.device`（`/dev/v4l/by-id/` のパス）が
+  つながっていて、OpenCV で開いて 1 フレーム取れるか（取ったら解放）。ノート PC 内蔵カメラ（名前に `Integrated_Webcam`）は
+  数えません。設定にない → `identify_cameras` を勧める。画像が来ない → 「手首カメラから画像が来ません。USB を挿し直して
+  ください」と `ask_user` で返し、次の呼び出しで確認し直す。
+- **アーム**: `/dev/serial/by-id/*OpenRB-150*`。`identify_arms` 済みならその by-id を今の `/dev/ttyACMn` に解決、
+  未特定ならフォロワー = launch の既定 `/dev/ttyACM0`、リーダー = もう一方（このリグでは `/dev/ttyACM1`）と仮定して、
+  `identify_arms` を勧める。
+- **フォロワーのドライバ**: 自分で起動した launch が生きているか、起動済みのロボットに `/joint_states` が届いているか、
+  `ros2 topic list` に `/joint_states` があるか。起動は
+  `ros2 launch open_manipulator_bringup omx_f_follower_ai.launch.py port_name:=/dev/ttyACM0`
+  を `bash -lc 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && exec ...'` で、
+  設定の `ros_domain_id`（42）を `ROS_DOMAIN_ID` に入れ、新しいセッションで起動。ログは `results/johnny/follower.log`、
+  `ctx.processes["follower"]` に登録。`/joint_states` が出るまで最大 25 秒待つ。
+- **openjev**: `http://127.0.0.1:8080` の `/health`（`/ready`、`/v1/models` も可）。コンテナがあれば `docker start openjev`、
+  なければ `HF_HUB_OFFLINE=1 bash scripts/serve_openjev.sh`。健康になるまで 1〜3 分かかるので「起動中」とだけ返し、
+  あとで `rig_status` で確認する。
+- **文字起こし**: `http://127.0.0.1:8010/health`。`docker start stt` か `bash scripts/stt_server.sh`。
+- **`OPENAI_API_KEY`**: `.env` か環境変数。
+
+俯瞰カメラを `identify_cameras` で替えた・回したあとは `calibrate_overhead` を勧めます（ロボット起動時にも校正します）。
+
+## 対話式の特定（`identify_cameras` / `identify_arms`）
+
+ステップマシンです。状態は `ctx.state["identify_cameras"]` / `ctx.state["identify_arms"]` にあり、各呼び出しは
+1 ステップだけ進めて、ユーザーへの指示を `text` に、`data = {"ask_user": true, "next": "<次のステップ>"}` を返します。
+LLM が指示を伝え、ユーザーが「抜いた」「挿した」と言ったら `step=<next>` で呼び直します。何も変わっていなければ
+同じ指示を繰り返すだけで、時間が経っても問題ありません。`step="cancel"` で中断。
+
+`identify_cameras`:
+
+1. `start`: つながっているカメラの一覧を控え、「手首カメラの USB を抜いてください」
+2. `wrist_unplugged`: 消えた 1 台が手首カメラ。残りが 1 台ならそれが俯瞰カメラ（→ `plugged`）、複数なら
+   「手首を挿し直して、俯瞰カメラを抜いてください」（→ `front_unplugged`）
+3. `plugged`: 両方つながっていて画像が来ることを確認し、`cameras.wrist.device` / `cameras.front.device` を
+   `scripts/setup_cameras.py` の `write_config` で書く（コメントは保たれる）。俯瞰画像を 0/90/180/270 度回して並べた
+   `results/johnny/cameras_front.jpg` を保存し、「ロボットが下側に来るのはどの角度ですか？（今は 180 度）」
+4. `rotation`（`rotate=0|90|180|270`）: `cameras.front.rotate` を書き、`results/johnny/rig.json` に控える。
+   `ctx.state["cameras_changed"]` を立てて `calibrate_overhead` を勧める。
+
+`identify_arms`: `start`（「リーダーアームの USB を抜いてください」）→ `leader_unplugged`（消えたポートがリーダー、残りが
+フォロワー。by-id の名前で `ctx.state["arms"]` と `rig.json` に保存）→ `plugged`（挿し直したあとの `/dev/ttyACMn` を解決）。
+設定ファイルには書きません。フォロワーの launch とテレオペは、この結果からポートを取ります。
+
+## テレオペ（`teleop_start` / `teleop_stop`）
+
+- リーダーの launch: `ros2 launch open_manipulator_bringup omx_l_leader_ai.launch.py port_name:=/dev/ttyACM1`
+  （launch 引数: `prefix`, `use_sim`, `use_mock_hardware`, `mock_sensor_commands`, `port_name`（既定 `/dev/ttyACM2`）,
+  `ros2_control_type`）。`/leader` 名前空間の `joint_trajectory_command_broadcaster` が、リーダーの関節を
+  `trajectory_msgs/JointTrajectory` として **`/leader/joint_trajectory`** に出します。
+- フォロワーの launch（`omx_f_follower_ai.launch.py`）は `ros2_control_node` の `/arm_controller/joint_trajectory` を
+  `/leader/joint_trajectory` にリマップしているので、両方が上がった瞬間からフォロワーが追従します（リーダーの姿勢へ
+  いきなり動くので、起動前に `ctx.say` で「手を離してください」と伝えます）。`open_manipulator_teleop` パッケージ
+  （`omx_f_teleop` はキーボード操作）や `cyclo_teleoperation` は使いません。
+- 前提: フォロワーのドライバ（なければ起動する）、リーダーのポートがあること。
+- `teleop_stop`: launch のプロセスグループに SIGINT（10 秒待って SIGTERM、SIGKILL）。フォロワーは最後の姿勢を保持。
+- **排他**: `RealOMX`（pick_place のブリッジ）も同じ `/leader/joint_trajectory` に出すので、
+  - タスク実行中（`ctx.state["task_running"]`）は `teleop_start` を拒否、
+  - テレオペ中に `pick_place` / `robot_home` / `robot_release` / `calibrate_overhead` を呼ぶと、先にテレオペを止めてから
+    実行し（結果に明記）、アームは `ctx.state["arm_moved_externally"]` によりまず `env.reset()`（はじめの姿勢、
+    グリッパー開、マークを取り直し）に戻ります。
+
+## ピック＆プレース（`pick_place`）
+
+1. 前提: openjev が健康（1〜3 分の起動中なら「openjev がまだ起動中です（あと 1〜3 分）」と返して始めない）、
+   フォロワーのドライバ（なければ起動）、`OPENAI_API_KEY`、テレオペ停止、他のタスクなし。
+2. 初回: `python -m dlb.voice.agent` と同じ引数（`argparse.Namespace`: `text=True, dry_run=False, objects, bin_name,
+   flat_place, robot_config, intent_model="gpt-5.5", effort="low", mark_model="gpt-5.5", mark_n=5, remark_s=30,
+   max_decisions=40, out="results/johnny", run_name=...`）で `Agent` を作り、`start_robot()` を 1 回だけ呼ぶ
+   （はじめの姿勢 → 物体と置き場所の発見（指定がなければ）→ 約 22 秒の自己校正）。`ctx.robot` に保持し、openjev の
+   クライアントもこの 1 つだけです。`objects` / `place` / `flat_place` は起動時にしか効きません。
+3. `agent.parse(instruction)` → 聞き返し（`clarify`）なら `ok=False, data={"clarify": ..., "ask_user": true}` で
+   質問文を返す → `agent.execute(tasks)`（完了までブロック）。
+4. **キャンセル**（`cancel(ctx)` / `stop_all`）: ランナーにキャンセルのフックがないので、`runner.max_decisions` と
+   `max_planner_calls` を 0 にします。次の判断（または次のプランナー呼び出し）で止まり、**進行中の 1 動作（俯瞰ガイド
+   の接近や置く動作の途中なら、その小タスク）は最後まで動きます**。アームはその場で保持。終わったら予算を元に戻します。
+   `ctx.state["task_running"]` / `["running_skill"]` が実行中の印です。
+
+## 校正（`calibrate_overhead`）
+
+`OverheadGuide.calibrate(env)`（`dlb/harness/marking.py`）をやり直します。ロボット未起動なら起動そのものが校正なので
+その結果を報告。起動済みなら、グリッパーが空・テレオペなし・タスクなしを確認し、`ctx.say` で「アームがはじめの姿勢の
+周りを動き回ります」と伝えてから、はじめの姿勢へ戻り、`guide.map` を新しい `TableMap` にして `calibrate`。結果は
+px/cm、回転、9 姿勢のうち何個が一致したか、秒数、却下された姿勢（「pose 3 at (21.0, 3.0) cm: gripper not found」など）。
+`RuntimeError` なら理由と、俯瞰画像・`cameras.front.rotate` を確認するよう勧めます。
+
+## 開発時の確認
+
+```bash
+PYTHONPATH=. MUJOCO_GL=egl .venv/bin/python -m pytest -q tests/test_johnny_skills.py   # ROS もカメラも不要（全部フェイク）
+.venv/bin/ruff check . && .venv/bin/ruff format --check .
+```
+
+`tests/test_johnny_skills.py` は `dlb/johnny/skills/rig.py` の機器アクセス（デバイス一覧、フレーム取得、HTTP、
+`subprocess`、launch の起動/停止）をフェイクに差し替えて、各スキルの判断・ステップマシン・排他・キャンセルを確かめます。
+実機（アームが動く、launch が上がる、カメラが開く、Docker）は未検証です。
