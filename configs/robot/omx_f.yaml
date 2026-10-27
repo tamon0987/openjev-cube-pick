@@ -23,7 +23,8 @@ tool_pitch_deg: begin
 # 60 deg down) -- REPLACE with a captured pose. rest: compact park.
 poses:
   begin: [0.008, -0.515, 0.773, 0.649, 0.0]  # 52 deg pitch: the wrist camera looks ~straight down
-  rest: [0.0, -0.69, 0.82, 1.35, 0.0]
+  # rest: the leader arm's parked pose (read from it 2026-10-27), joint2 pulled 4 deg inside the firmware limit
+  rest: [-0.014, -1.80, 1.523, 1.588, -0.043]
 begin_time_s: 3.0
 # tcp height (m above the table) for reaching / aligning over the cube: from the begin pose the cube fills half the
 # wrist image and the servo stopped with the cross on its edge; from 12 cm it spans about a third.
