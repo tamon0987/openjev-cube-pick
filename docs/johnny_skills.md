@@ -30,15 +30,30 @@ Johnny（`dlb/johnny/`）は、ウェイクワードのあとの発話を LLM（
 
 ## セットアップの確認（`rig_status` / `rig_setup`）
 
+`rig_setup` は、役割が未確認のときに次の対話を行い、完了後にサービスとロボットを起動します。
+
+1. 「フォロワーアームのUSBだけを抜いてください」→「外した」
+2. 消えたUSB固有IDをフォロワー、残った1台をリーダーとして確認し、「フォロワーを挿し直してください」
+3. 再接続を確認したら、「フォロワーアームの手首カメラのUSBを抜いてください」→「外した」
+4. 手首カメラを確認し、残った外付けカメラを俯瞰カメラとして案内して、再接続を待ちます。
+   外付けカメラが3台以上なら、俯瞰カメラも抜き差しして確認します。
+5. 保存した比較画像で俯瞰カメラの回転を確認してから、通常のセットアップに進みます。
+
+各返答後は同じ `rig_setup` を `step=data.next` で呼びます。最初の `start` / `robot` オプションは対話中保持します。
+`robot=false` ならカメラ識別とロボット起動を省略し、アームの確認だけ行います。
+確認済みのUSB固有IDとカメラ設定が現在の接続に一致すれば、抜き差しは省略します。ポート番号の変更は固有IDで追跡します。
+アームが1台しか見つからなくてもフォロワーとは決めつけません。ドライバやテレオペが起動中なら、未確認アームのUSBを
+抜くようには案内せず、先に終了を求めます。`step=cancel` や「止まって」で中断できます。途中までに確認・保存した設定は残ります。
+
 確認する項目と、足りないときの扱い:
 
 - **カメラ**: `configs/robot/omx_f.yaml` の `cameras.wrist.device` / `cameras.front.device`（`/dev/v4l/by-id/` のパス）が
   つながっていて、OpenCV で開いて 1 フレーム取れるか（取ったら解放）。ノート PC 内蔵カメラ（名前に `Integrated_Webcam`）は
   数えません。設定にない → `identify_cameras` を勧める。画像が来ない → 「手首カメラから画像が来ません。USB を挿し直して
   ください」と `ask_user` で返し、次の呼び出しで確認し直す。
-- **アーム**: `/dev/serial/by-id/*OpenRB-150*`。`identify_arms` 済みならその by-id を今の `/dev/ttyACMn` に解決、
-  未特定ならフォロワー = launch の既定 `/dev/ttyACM0`、リーダー = もう一方（このリグでは `/dev/ttyACM1`）と仮定して、
-  `identify_arms` を勧める。
+- **アーム**: `/dev/serial/by-id/*OpenRB-150*`。確認済みならその by-id を今の `/dev/ttyACMn` に解決します。
+  `rig_setup` では未特定のまま起動せず、上の対話へ進みます。読み取りだけの `rig_status` は未特定なら
+  ポート番号からの仮定である旨を表示し、`identify_arms` を勧めます。
 - **フォロワーのドライバ**: 自分で起動した launch が生きているか、起動済みのロボットに `/joint_states` が届いているか、
   `ros2 topic list` に `/joint_states` があるか。起動は
   `ros2 launch open_manipulator_bringup omx_f_follower_ai.launch.py port_name:=/dev/ttyACM0`
@@ -141,22 +156,8 @@ joint2 が -1.86 rad まで飛び、ID 13 / 15 が過負荷エラーになりま
 
 ## 把持と置いたことの確認（`pick_place`）
 
-緑のキューブが持ち上げた直後に滑り落ち、グリッパーの読み値は「閉じて何かを握っている」のまま、ロボットが「完了」と
-言ったことがありました。グリッパーの読み値だけで「持っている」と判断することはもうしません。
-
-- **把持の確認**（`TwoTierRunner.held_check`、`dlb/harness/twotier.py`）: ランナーに `held_check(env, images, where)
-  -> (held, p_yes)` という呼び出し可能オブジェクトを差し込めます（既定 None = シミュレーション: グリッパー/溶接の
-  真値をそのまま使う）。実機では `ensure_robot` が `JevHeldCheck(policy.be)`（ポリシーと同じ openjev クライアント、
-  2 つ目は作らない）を差し込みます。手首画像に Noul（はい/いいえ）を 1 問、「Is the <object> held between the
-  gripper fingers right now (not lying on the table below)?」、約 0.4 秒。
-  - 呼ぶ場所: **GRASP の直後**（`grasp`）、**持ち上げて搬送高さに着いたとき**（`lift`）、**水平移動のあと、降ろす前**
-    （`travel`）、**放す直前**（`release`）。「ここに置く」（`here`）は搬送がないので `grasp` だけ。
-  - 「持っていない」と出たら: `grasp` ならこれまでの空振り（missed_grasp）と同じ扱い。搬送中なら**搬送を中止**
-    （ビンの上では放さない）: グリッパーを開いてホバー高さへ上がり、俯瞰マークをバックグラウンドで取り直し、
-    プランナーはそのピックからやり直す（`TaskPlanner.restart_index`。物体は落ちた先で見つかる）。1 ピックあたり
-    `retries`（2）回まで。
-  - ログ: エピソードログに `held_check` レコード（where、held、p_yes、latency、手首画像）と、中止したときは
-    `outcome: dropped` のイベント。`TwoTierResult.drops` / `held_checks`。
+- **把持の確認**: グリッパーの開度を使います。把持直後や搬送中に手首画像を Jev へ送る確認は行いません。
+  開度だけでは搬送中に物体が滑り落ちても検出できない場合があります。
 - **置いたことの確認**（`verify_place`、`dlb/johnny/skills/pick_place.py`）: タスク列が「置く」で終わるとき、
   ランナーがはじめの姿勢に戻ったあとに始まるアイドルマーク（`Agent.idle_mark`）を `guide.join()` で待ち、その
   俯瞰マークで最後にピックした物体の点が置き場所の箱（`Marks.boxes[place]`）の中にあるかを見ます。
@@ -168,11 +169,10 @@ joint2 が -1.86 rad まで飛び、ID 13 / 15 が過負荷エラーになりま
   `text = "NOT confirmed: ...; placed, but the green cube is NOT in the tray: it lies at (15, 15) cm on the table,
   7 cm from the tray"` で返します（LLM は「完了」と言ってはいけない、と説明文に明記）。エピソードログに
   `verify` レコードを追記します。
-- 結果の文には何を確認したかを書きます: `held confirmed by the wrist camera (4 checks, lowest p 0.88); placed,
-  confirmed by the overhead image: the green cube is in the tray`。ランナーが途中で止まったとき
+- 結果には俯瞰画像による置き場所の確認を書きます。ランナーが途中で止まったとき
   （`stop_reason != planner_complete`）は `NOT done: ...` で `ok=False`。
-- 追加の時間: 把持確認は 1 回約 0.4 秒 × 4 回 ≈ 2 秒、置いたことの確認はアイドルマーク（gpt-5.5、約 5〜8 秒）
-  を待つ分。やり直しが起きたときは 1 タスク分（約 45 秒）が加わります。
+- 追加の時間: 置いたことの確認はアイドルマーク（gpt-5.5、約 5〜8 秒）を待つ分。
+  やり直しが起きたときは 1 タスク分（約 45 秒）が加わります。
 
 ## 安全停止（`safe_stop`）と即時停止（`stop_all`）
 

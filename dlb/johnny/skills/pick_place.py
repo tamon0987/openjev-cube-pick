@@ -6,12 +6,8 @@ skill -- ``rig_setup`` by default -- and kept in ``ctx.robot``; starting it move
 runs the ~22 s overhead self-calibration. ``robot_home`` and ``robot_release`` are the small moves one asks for
 by voice.
 
-Verification (a cube once slipped right after the lift while the gripper reading said "closed on object", and
-the robot reported done): the runner gets a ``held_check`` (``JevHeldCheck``: the wrist image, one yes/no question
-to Jev, ~0.4 s) that runs after the grasp, after the lift, after the level travel and right before the release;
-a failed check aborts the carry and the pick starts over where the object lies now. After the task one fresh
-overhead mark (the idle mark that starts anyway) must show the object inside the place's box (a flat place:
-within 4 cm of its mark); otherwise the result says so (ok=False) after one retry of the whole task.
+After a task, one fresh overhead mark must show the object inside the place's box (a flat place: within
+4 cm of its mark); otherwise the result says so (ok=False) after one retry of the whole task.
 
 Cancel: the runner has no cancel hook, so ``cancel`` zeroes its decision and planner budgets -- it stops at the
 next decision (an in-flight move, or a guided approach / place in progress, finishes first) and the arm holds
@@ -104,7 +100,6 @@ def ensure_robot(
             raise
         return None, f"could not start the robot: {e}"
     _record_results(agent)
-    install_held_check(agent)
     ctx.robot = agent
     ctx.state.pop("arm_moved_externally", None)
     ctx.log(f"robot started: objects {agent.objects}, place {agent.args.bin_name!r}")
@@ -124,18 +119,6 @@ def _record_results(agent: Any) -> None:
         return r
 
     runner.run, runner._johnny_wrapped = run, True
-
-
-def install_held_check(agent: Any) -> Any:
-    """The visual held check on the runner, with the policy's own Jev client (never a second one)."""
-    runner = agent.runner
-    be = getattr(getattr(runner, "policy", None), "be", None)
-    if runner is None or be is None:
-        return None
-    from dlb.harness.twotier import JevHeldCheck
-
-    runner.held_check = JevHeldCheck(be)
-    return runner.held_check
 
 
 def return_to_begin(ctx: Context, agent: Any) -> None:
@@ -245,18 +228,6 @@ def _log_verify(agent: Any, rec: dict[str, Any]) -> None:
         pass
 
 
-def held_summary(agent: Any) -> tuple[str, dict[str, Any]]:
-    check = getattr(agent.runner, "held_check", None)
-    records = list(getattr(check, "records", []) or [])
-    if not records:
-        return "no visual held check", {"held_checks": 0}
-    lowest = min(r["p_yes"] for r in records)
-    return (
-        f"held confirmed by the wrist camera ({len(records)} checks, lowest p {lowest:.2f})",
-        {"held_checks": len(records), "held_lowest_p": lowest},
-    )
-
-
 class PickPlace(Skill):
     name = "pick_place"
     description = (
@@ -264,8 +235,8 @@ class PickPlace(Skill):
         "put down where it is), from the user's own words: 'put the carrot in the tray', '人参をトレーに入れて', "
         "'赤いのをビンに', 'それを青いキューブの上に', 'その場に置いて'. Pass the instruction as said. Starts the "
         "robot first when rig_setup did not (begin pose + ~30 s camera self-calibration); the objects and the "
-        "container are found in the overhead image unless given. Blocks until the task ends. The grasp is checked "
-        "with the wrist camera along the carry and the place with the overhead image afterwards: ok=false with "
+        "container are found in the overhead image unless given. Blocks until the task ends. The place is checked "
+        "with the overhead image afterwards: ok=false with "
         "data.verified=false means the object is NOT where it should be -- never report success then. If the "
         "instruction is ambiguous the result is a question to ask the user (ok=false, data.clarify). Not while "
         "tele-operation runs (it is stopped first) or another task runs."
@@ -326,6 +297,14 @@ class PickPlace(Skill):
                 prefix + "could not parse the instruction (OpenAI request failed); say it again", ok=False
             )
         if intent.clarify:
+            # an object the user names may have been put down after start-up: look again, then parse again
+            try:
+                added = agent.refresh_objects()
+            except Exception as e:  # noqa: BLE001 - the clarify question stands
+                added, _ = [], ctx.log(f"refresh_objects failed: {e}")
+            if added:
+                intent = agent.parse(instruction) or intent
+        if intent.clarify:
             return SkillResult(
                 prefix + intent.clarify, ok=False, data={"clarify": intent.clarify, "ask_user": True}
             )
@@ -337,9 +316,6 @@ class PickPlace(Skill):
         ctx.state["task_running"], ctx.state["running_skill"] = True, self
         runner = agent.runner
         budgets = (runner.max_decisions, runner.max_planner_calls)
-        check = getattr(runner, "held_check", None)
-        if check is not None and hasattr(check, "records"):
-            check.records.clear()
         attempts, verdict, r = 0, None, None
         try:
             return_to_begin(ctx, agent)
@@ -367,7 +343,6 @@ class PickPlace(Skill):
             runner.max_decisions, runner.max_planner_calls = budgets
             ctx.state["task_running"], ctx.state["running_skill"] = False, None
         held = agent.state.held
-        held_text, held_data = held_summary(agent)
         complete = getattr(r, "stop_reason", "") == "planner_complete"
         data = {
             "tasks": intent.tasks,
@@ -376,10 +351,8 @@ class PickPlace(Skill):
             "stop_reason": getattr(r, "stop_reason", ""),
             "decisions": getattr(r, "decisions", None),
             "missed_grasps": getattr(r, "missed_grasps", None),
-            "drops": getattr(r, "drops", None),
             "attempts": attempts,
             "verified": None if verdict is None else verdict.ok,
-            **held_data,
         }
         if self._cancel.is_set():
             return SkillResult(
@@ -387,24 +360,21 @@ class PickPlace(Skill):
                 data=data,
             )
         done = ", ".join(f"{t['op']} {t.get('object') or t.get('where')}" for t in intent.tasks)
-        stats = (
-            f"{data['decisions']} decisions, {data['missed_grasps']} missed grasps, {data['drops'] or 0} drops"
-            + (f", {attempts} attempts" if attempts > 1 else "")
+        stats = f"{data['decisions']} decisions, {data['missed_grasps']} missed grasps" + (
+            f", {attempts} attempts" if attempts > 1 else ""
         )
         if not complete:
             return SkillResult(
                 prefix + f"NOT done: {done} stopped early ({data['stop_reason'] or 'unknown'}; {stats}); "
-                f"{held_text}; holding {held or 'nothing'}",
+                f"holding {held or 'nothing'}",
                 ok=False,
                 data=data,
             )
         if verdict is None:
-            return SkillResult(
-                prefix + f"done: {done} ({stats}); {held_text}; holding {held or 'nothing'}", data=data
-            )
+            return SkillResult(prefix + f"done: {done} ({stats}); holding {held or 'nothing'}", data=data)
         ok = verdict.ok is True
         return SkillResult(
-            prefix + f"{'done' if ok else 'NOT confirmed'}: {done} ({stats}); {held_text}; {verdict.text}; "
+            prefix + f"{'done' if ok else 'NOT confirmed'}: {done} ({stats}); {verdict.text}; "
             f"holding {held or 'nothing'}",
             ok=ok,
             data=data,

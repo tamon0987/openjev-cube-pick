@@ -12,7 +12,7 @@ from dlb.harness.twotier import (
     TwoTierRunner,
     summarize_twotier,
 )
-from dlb.sim.env import OPEN_MIN, Z_GRASP, Z_HOVER, PickPlaceEnv
+from dlb.sim.env import OPEN_MIN, Z_GRASP, PickPlaceEnv
 
 
 def test_oracle_commands_complete_the_task_through_the_two_tier_harness():
@@ -76,7 +76,7 @@ def test_descent_moves_from_the_measured_tcp_not_a_stale_command():
 
 
 # --------------------------------------------------------------------------- #
-# the visual held check along the carry (TwoTierRunner.held_check), with fakes
+# the grasp and carry sequence, with fakes
 # --------------------------------------------------------------------------- #
 class _CarryEnv:
     """Just enough robot for the task-list loop: a gripper that closes on a cube when it is low enough."""
@@ -163,107 +163,44 @@ class _CarryPolicy:
         return Decision("GRASP", 1.0)
 
 
-def test_runner_held_check_aborts_the_carry_and_picks_again(tmp_path):
-    import json
-
-    from dlb.harness.twotier import RELEASE_Z, TRANSPORT_Z, TaskPlanner, TwoTierRunner
+def test_grasp_carries_until_release_without_visual_hold_queries():
+    from dlb.harness.twotier import TRANSPORT_Z, TaskPlanner, TwoTierRunner
 
     env = _CarryEnv()
+    released = []
+    original_open = env.open_gripper
+
+    def record_open():
+        released.append((env.held, env.tcp_pos.copy()))
+        original_open()
+
+    env.open_gripper = record_open
     guide = _CarryGuide(env)
-    tasks = [{"op": "pick", "object": "green cube"}, {"op": "place", "where": "bin"}]
-    runner = TwoTierRunner(
-        env, TaskPlanner(tasks), _CarryPolicy(), log_dir=tmp_path, save_images=False, guide=guide
-    )
-    seen = []
-    answers = iter([True, False])  # grasp ok, then the lift check says the cube is gone
-
-    def held_check(env_, images, where):
-        seen.append((where, round(float(env_.tcp_pos[2]), 3)))
-        ok = next(answers, True)
-        return ok, 0.9 if ok else 0.1
-
-    runner.held_check = held_check
-    res = runner.run(0, seed=0, reset=False, keep_marks=True)
-    assert res.stop_reason == "planner_complete" and res.drops == 1 and res.missed_grasps == 0
-    assert res.held_checks == 6 and [w for w, _ in seen] == [
-        "grasp",
-        "lift",
-        "grasp",
-        "lift",
-        "travel",
-        "release",
-    ]
-    assert seen[1][1] == TRANSPORT_Z and seen[4][1] == TRANSPORT_Z and seen[5][1] == RELEASE_Z
-    assert not env.held and env.aperture > OPEN_MIN  # released in the bin at the end
-    # after the drop: opened, raised, the scene marked again, the planner restarted from the pick
-    assert ("reset", None, None) in guide.calls and ("mark", "begin", None) in guide.calls
-    assert [c for c in guide.calls if c[0] in ("cube", "bin")] == [
-        ("cube", Z_HOVER, None),
-        ("cube", Z_HOVER, None),
-        ("bin", TRANSPORT_Z, None),
-    ]
-    recs = [json.loads(ln) for ln in (tmp_path / "ep0000.jsonl").read_text().splitlines()]
-    checks = [r for r in recs if r["type"] == "held_check"]
-    assert [(c["where"], c["held"], c["p_yes"]) for c in checks][:2] == [
-        ("grasp", True, 0.9),
-        ("lift", False, 0.1),
-    ]
-    drop = [r for r in recs if r["type"] == "event" and r["outcome"] == "dropped"]
-    assert len(drop) == 1 and drop[0]["task_index"] == 0 and "lift" in drop[0]["reason"]
-
-
-def test_runner_without_a_held_check_trusts_the_gripper(tmp_path):
-    from dlb.harness.twotier import TaskPlanner, TwoTierRunner
-
-    env = _CarryEnv()
     runner = TwoTierRunner(
         env,
-        TaskPlanner([{"op": "pick", "object": "x"}, {"op": "place", "where": "bin"}]),
+        TaskPlanner([{"op": "pick", "object": "cube"}, {"op": "place", "where": "bin"}]),
         _CarryPolicy(),
         log_dir=None,
-        guide=_CarryGuide(env),
+        guide=guide,
     )
-    res = runner.run(0, seed=0, reset=False, keep_marks=True)
-    assert res.stop_reason == "planner_complete" and res.drops == 0 and res.held_checks == 0
+    result = runner.run(0, seed=0, reset=False, keep_marks=True)
+    assert result.stop_reason == "planner_complete" and result.missed_grasps == 0
+    assert [call for call in guide.calls if call[0] == "bin"] == [("bin", TRANSPORT_Z, None)]
+    assert len(released) == 1 and released[0][0]
+    assert released[0][1][0] == 0.25  # only opens once it reaches the bin
 
 
-def test_runner_held_check_after_the_grasp_counts_as_a_missed_grasp(tmp_path):
-    from dlb.harness.twotier import TaskPlanner, TwoTierRunner
+def test_cross_point_shifts_along_the_wrist_up_axis():
+    from dlb.harness.twotier import cross_point
 
-    env = _CarryEnv()
-    runner = TwoTierRunner(
-        env,
-        TaskPlanner([{"op": "pick", "object": "x"}, {"op": "place", "where": "bin"}]),
-        _CarryPolicy(),
-        log_dir=None,
-        guide=_CarryGuide(env),
-    )
-    answers = iter([False])
-    runner.held_check = lambda e, i, w: (next(answers, True), 0.5)
-    res = runner.run(0, seed=0, reset=False, keep_marks=True)
-    assert res.stop_reason == "planner_complete" and res.missed_grasps == 1 and res.drops == 0
+    class Env:
+        tcp_pos = np.array([0.2, 0.0, 0.1])
+        cross_offset_fwd = 0.01
 
+        def wrist_axes(self):
+            return np.array([0.0, 1.0]), np.array([1.0, 0.0])
 
-def test_jev_held_check_asks_one_noul_on_the_wrist_image():
-    from dlb.contract import make_noul_answer
-    from dlb.harness.twotier import JevHeldCheck, set_object_names
-
-    class Backend:
-        def __init__(self):
-            self.reqs = []
-
-        def decide(self, req):
-            self.reqs.append(req)
-            return SimpleNamespace(answers={"held": make_noul_answer(0.2)})
-
-    set_object_names("green cube", "tray")
-    be = Backend()
-    check = JevHeldCheck(be)
-    env = SimpleNamespace(render_all=lambda: {"wrist": np.zeros((8, 8, 3), np.uint8)})
-    held, p = check(env, {"wrist": np.zeros((8, 8, 3), np.uint8)}, "lift")
-    assert (held, p) == (False, 0.2) and check.records == [{"where": "lift", "p_yes": 0.2}]
-    req = be.reqs[0]
-    assert list(req.questions) == ["held"] and "green cube" in req.questions["held"].instructions
-    assert (
-        req.state["stage"] == "lift" and len(req.images) == 1 and req.images[0].startswith("data:image/jpeg")
-    )
+    p = cross_point(Env(), 0.015)
+    assert np.allclose(p, [0.2, 0.01, 0.015])  # 1 cm along "up" (here +y), at the asked height
+    Env.cross_offset_fwd = 0.0
+    assert np.allclose(cross_point(Env(), 0.015), [0.2, 0.0, 0.015])

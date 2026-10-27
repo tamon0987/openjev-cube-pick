@@ -226,11 +226,35 @@ class RigSetup(Skill):
         "the speech-to-text server. Use for 'set up the robot', 'ロボットのセットアップして', 'start everything', "
         "'ドライバを起動して'. Then, by default, it also starts the robot: the arm moves to the begin pose and around it "
         "for ~25 s to calibrate the overhead camera (so pick_place can start right away); robot=false skips "
-        "that. Cameras that give no frame become an instruction for the user."
+        "that. Before starting an arm, verify its saved USB identity. If the roles are unknown, guide the user "
+        "through unplugging and reconnecting the FOLLOWER USB, then its WRIST CAMERA USB. Confirm the overhead camera rotation too. Relay the question and WAIT for the user's "
+        "answer, then call rig_setup again with step=data.next. Do not switch to another skill to continue. "
+        "start/robot options are remembered during this dialogue. step=cancel aborts. "
+        "Cameras that give no frame become an instruction for the user."
     )
     parameters = {
         "type": "object",
         "properties": {
+            "step": {
+                "type": "string",
+                "enum": [
+                    "start",
+                    "follower_unplugged",
+                    "follower_plugged",
+                    "camera_start",
+                    "camera_wrist_unplugged",
+                    "camera_front_unplugged",
+                    "camera_plugged",
+                    "camera_rotation",
+                    "cancel",
+                ],
+                "description": "Default start. Continue with the previous result's next step only after the user answers.",
+            },
+            "rotate": {
+                "type": "integer",
+                "enum": [0, 90, 180, 270],
+                "description": "camera_rotation only: the angle confirmed by the user.",
+            },
             "start": {
                 "type": "array",
                 "items": {"type": "string", "enum": list(SERVICES)},
@@ -245,9 +269,154 @@ class RigSetup(Skill):
         "additionalProperties": False,
     }
 
-    def run(self, ctx: Context, start: list[str] | None = None, robot: bool = True, **_: Any) -> SkillResult:
+    def cancel(self, ctx: Context) -> None:
+        st = ctx.state.pop("rig_setup_dialogue", {})
+        if st.get("camera_started"):
+            from dlb.johnny.skills.identify import IdentifyCameras
+
+            IdentifyCameras().run(ctx, step="cancel")
+
+    def _confirm_arms(self, ctx: Context, st: dict[str, Any], step: str) -> SkillResult | None:
+        from dlb.johnny.skills.identify import ask
+
+        devs = {p.name: rig.resolve(p) for p in rig.list_arm_ports()}
+        saved = ctx.state.get("arms") or rig.load_rig().get("arms") or {}
+        ids = {role: (saved.get(role) or {}).get("by_id") for role in ("follower", "leader")}
+        if "seen" not in st and len(set(ids.values())) == 2 and all(i in devs for i in ids.values()):
+            arms = {role: {"by_id": i, "dev": devs[i]} for role, i in ids.items()}
+        else:
+            if ctx.running("leader") or ctx.running("relay") or ctx.state.get("teleop"):
+                return SkillResult(
+                    "テレオペを終了してから、もう一度セットアップしてください。アームの識別はまだ行っていません。",
+                    ok=False,
+                )
+            if ctx.robot is not None or rig.follower_running(ctx, rig.load_config(ctx.robot_config)):
+                return SkillResult(
+                    "アームのドライバが起動中なので、USBの取り外し確認を始められません。"
+                    "ドライバを停止してから、もう一度セットアップしてください。",
+                    ok=False,
+                )
+            expected = st.get("next", "start")
+            if step != expected:
+                return ask("前の案内に従って接続を確認し、できたら教えてください。", expected)
+            if expected == "start":
+                if len(devs) != 2:
+                    return ask(
+                        f"アームを {len(devs)} 台検出しました。リーダーとフォロワーの2台をUSB接続して、できたら教えてください。"
+                        "ポート番号だけでは役割を決めません。",
+                        "start",
+                    )
+                st.update(seen=devs, next="follower_unplugged")
+                return ask(
+                    "ポートの役割を確認します。フォロワーアーム（実際に作業する方）のUSBだけを抜いてください。"
+                    "リーダーは接続したままにして、抜けたら教えてください。",
+                    "follower_unplugged",
+                )
+            if expected == "follower_unplugged":
+                seen = st["seen"]
+                gone = set(seen) - set(devs)
+                if len(gone) != 1 or len(devs) != 1 or not set(devs) < set(seen):
+                    return ask(
+                        "フォロワー1台だけが外れた状態を確認できません。リーダーだけを接続した状態にして、教えてください。",
+                        "follower_unplugged",
+                    )
+                st.update(
+                    ids={"follower": next(iter(gone)), "leader": next(iter(devs))}, next="follower_plugged"
+                )
+                return ask(
+                    "フォロワーのポートが確認できました。フォロワーのUSBを挿し直して、できたら教えてください。",
+                    "follower_plugged",
+                )
+            ids = st["ids"]
+            if not all(i in devs for i in ids.values()):
+                return ask(
+                    "確認した2台のUSB接続がまだ揃っていません。両方を接続してから教えてください。",
+                    "follower_plugged",
+                )
+            arms = {role: {"by_id": i, "dev": devs[i]} for role, i in ids.items()}
+            # Commit only after reconnection; cancelling a partial dialogue changes no mapping.
+            rig.save_rig(arms=arms)
+        ctx.state["arms"] = arms
+        follower, leader = arms["follower"]["dev"], arms["leader"]["dev"]
+        ctx.say(f"フォロワーは {follower}、リーダーは {leader} と確認できました。")
+        if ctx.running("follower") and ctx.state.get("follower_port") != follower:
+            return SkillResult(
+                "起動中のフォロワードライバのポートが、確認したポートと一致しません。"
+                "ドライバを停止してから、もう一度セットアップしてください。",
+                ok=False,
+            )
+        st.pop("seen", None)
+        st.pop("next", None)
+        return None
+
+    def _confirm_cameras(
+        self, ctx: Context, st: dict[str, Any], step: str, rotate: int | None
+    ) -> SkillResult | None:
+        from dlb.johnny.skills.identify import IdentifyCameras, ask
+
         cfg = rig.load_config(ctx.robot_config)
-        want = set(start or SERVICES)
+        saved = rig.load_rig().get("cameras") or {}
+        present = {str(p) for p in rig.list_cameras()}
+        known = (
+            saved.get("wrist") != saved.get("front")
+            and all(
+                saved.get(c) in present and saved.get(c) == cfg.get("cameras", {}).get(c, {}).get("device")
+                for c in ("wrist", "front")
+            )
+            and saved.get("rotate") == cfg.get("cameras", {}).get("front", {}).get("rotate", 0)
+        )
+        if known and not st.get("camera_started"):
+            return None
+        if ctx.robot is not None:
+            return SkillResult(
+                "カメラを使用中です。ロボットを終了してから、もう一度セットアップしてください。", ok=False
+            )
+        expected = st.get("camera_next", "camera_start")
+        if st.get("camera_started") and step != expected:
+            return ask("前のカメラ確認の案内に従い、できたら教えてください。", expected)
+        st["camera_started"] = True
+        res = IdentifyCameras().run(ctx, step=expected.removeprefix("camera_"), rotate=rotate)
+        if res.data and res.data.get("ask_user"):
+            st["camera_next"] = "camera_" + res.data["next"]
+            res.data["next"] = st["camera_next"]
+            return res
+        if not res.ok:
+            return res
+        st.pop("camera_started", None)
+        st.pop("camera_next", None)
+        ctx.say("アームとカメラの接続を確認できました。セットアップを続けます。")
+        return None
+
+    def run(
+        self,
+        ctx: Context,
+        start: list[str] | None = None,
+        robot: bool | None = None,
+        step: str = "start",
+        rotate: int | None = None,
+        **_: Any,
+    ) -> SkillResult:
+        if step == "cancel":
+            self.cancel(ctx)
+            return SkillResult("セットアップの確認を中止しました。確認済みで保存した機器設定は保持します。")
+        if step not in self.parameters["properties"]["step"]["enum"]:
+            return SkillResult(f"unknown setup step: {step}", ok=False)
+        cfg = rig.load_config(ctx.robot_config)
+        st = ctx.state.setdefault("rig_setup_dialogue", {})
+        st.setdefault("start", list(start or SERVICES))
+        st.setdefault("robot", True if robot is None else robot)
+        want, robot = set(st["start"]), st["robot"]
+        if "follower" in want or robot:
+            # Camera steps start only after the arms have been identified. Recheck the saved IDs on every turn.
+            confirmation = self._confirm_arms(ctx, st, "start" if step.startswith("camera_") else step)
+            if confirmation is not None:
+                return confirmation
+            if robot:
+                confirmation = self._confirm_cameras(ctx, st, step, rotate)
+                if confirmation is not None:
+                    return confirmation
+        self.cancel(ctx)
+        cfg = rig.load_config(ctx.robot_config)
         started: list[str] = []
         checks = [*check_cameras(cfg, ctx), check_arms(ctx, cfg)]
         if "follower" in want and not rig.follower_running(ctx, cfg):
@@ -295,6 +464,8 @@ class RigSetup(Skill):
         agent, err = ensure_robot(ctx)
         if agent is None:
             return Check("robot", False, f"robot start failed: {err}")
+        # A freshly started robot has calibrated the camera selected by this dialogue.
+        ctx.state.pop("cameras_changed", None)
         started.append(
             "the robot: begin pose, overhead calibrated ("
             + describe(getattr(agent.guide, "calibration", None))

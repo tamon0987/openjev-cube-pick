@@ -22,8 +22,7 @@ import itertools
 import json
 import os
 import time
-from collections.abc import Callable
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -154,9 +153,21 @@ def cross_height(sub: Subtask | None) -> float:
     return BIN_RIM_Z if sub is not None and sub.name in ("transport_to_bin", "release") else CUBE_Z
 
 
+def cross_point(env: PickPlaceEnv, height: float) -> np.ndarray:
+    """The table point the green cross stands for: below the tcp at ``height``, shifted ``env.cross_offset_fwd``
+    (m, real rig config ``grasp_cross_offset_m``) along the wrist image's "up" so the fingers close that much
+    nearer the base side of the object the servo centres on the cross."""
+    p = np.array([*env.tcp_pos[:2], height], float)
+    off = float(getattr(env, "cross_offset_fwd", 0.0) or 0.0)
+    if off:
+        fwd, _ = env.wrist_axes()
+        p[:2] += np.asarray(fwd, float)[:2] * off
+    return p
+
+
 def wrist_with_cross(env: PickPlaceEnv, img: np.ndarray, height: float) -> np.ndarray:
-    """Draw a green cross where the point directly below the tcp at ``height`` appears."""
-    px = env.wrist_pixel(np.array([*env.tcp_pos[:2], height]), size=img.shape[0])
+    """Draw a green cross where the point directly below the tcp at ``height`` appears (see ``cross_point``)."""
+    px = env.wrist_pixel(cross_point(env, height), size=img.shape[0])
     if px is None:
         return img
     out = img.copy()
@@ -179,7 +190,7 @@ def zoom_on_cross(env: PickPlaceEnv, img: np.ndarray, height: float, half: int |
 
     half = int(half or getattr(env, "zoom_half", 64) * img.shape[0] / 320)
 
-    px = env.wrist_pixel(np.array([*env.tcp_pos[:2], height]), size=img.shape[0])
+    px = env.wrist_pixel(cross_point(env, height), size=img.shape[0])
     h, w = img.shape[:2]
     x, y = (w // 2, h // 2) if px is None else (int(px[0]), int(px[1]))
     x0, y0 = int(np.clip(x - half, 0, w - 2 * half)), int(np.clip(y - half, 0, h - 2 * half))
@@ -585,13 +596,6 @@ class TaskPlanner:
                 )
         subs = [s for i, t in enumerate(self.tasks) if i >= start for s in self._subs(i, t)]
         return Plan(task_complete=False, subtasks=subs, scene=f"tasks from {start}: {self.tasks[start:]}")
-
-    def restart_index(self, task_index: int) -> int:
-        """The task to restart from when the held object was lost during task ``task_index``: its pick."""
-        for j in range(min(task_index, len(self.tasks) - 1), -1, -1):
-            if self.tasks[j]["op"] == "pick":
-                return j
-        return task_index
 
 
 TASK_ORDER = ["reach_cube", "align_cube", "descend_grasp", "transport_to_bin", "release"]
@@ -1007,41 +1011,6 @@ class JevPerceptionPolicy(JevCommandPolicy):
         return "SUBTASK_DONE", conf
 
 
-class JevHeldCheck:
-    """``TwoTierRunner.held_check`` for the real rig: one yes/no question to the decision layer on the wrist image
-    (~0.4 s), "Is the <object> held between the gripper fingers?". The gripper reading alone cannot tell a
-    grasp that slipped right after the lift (a cube once lay next to its pick spot while the robot reported
-    done). The object's name is the one the fast layer's prompts use (``set_object_names``)."""
-
-    def __init__(self, backend: DecisionBackend, threshold: float = 0.5):
-        self.be, self.threshold = backend, threshold
-        self.records: list[dict[str, Any]] = []  # every check (where, p_yes), for the caller's summary
-
-    def __call__(self, env: PickPlaceEnv, images: dict[str, np.ndarray], where: str) -> tuple[bool, float]:
-        img = images.get("wrist")
-        if img is None:
-            img = env.render_all()["wrist"]
-        name = OBJ["cube"]
-        req = DecisionRequest(
-            state={
-                "note": "Wrist camera view from a robot gripper looking down, after a grasp. An object held "
-                "between the fingers is close to the camera and partly covered by the fingers; the table and "
-                "anything lying on it are further away.",
-                "stage": where,
-            },
-            questions={
-                "held": Noul(
-                    instructions=f"Is the {name} held between the gripper fingers right now (not lying on the "
-                    "table below)?"
-                )
-            },
-            images=[image_to_data_url(img, fmt="JPEG")],
-        )
-        p = float(self.be.decide(req).answers["held"].noul or 0.0)
-        self.records.append({"where": where, "p_yes": round(p, 3)})
-        return p >= self.threshold, p
-
-
 class JevServoPolicy(JevCommandPolicy):
     """Binary servo: ask only which side of the cross the target is on, per axis, and stop at the flip.
 
@@ -1351,8 +1320,6 @@ class TwoTierResult:
     planner_tokens: dict[str, int] = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0})
     subtasks: list[str] = field(default_factory=list)
     missed_grasps: int = 0
-    drops: int = 0  # the held check said the object was lost during the carry (aborted, picked again)
-    held_checks: int = 0
     pre_moves: int = 0
     stop_reason: str = ""
     reset_s: float = 0.0  # the reset (to the begin pose), before wall_time_s starts
@@ -1402,11 +1369,6 @@ class TwoTierRunner:
         )
         self.log_dir = Path(log_dir) if log_dir else None
         self.save_images = save_images
-        # Optional visual check that the object is really held (the real rig installs ``JevHeldCheck``): called
-        # as ``held_check(env, images, where) -> (held, p_yes)`` after the grasp, after the lift, after the level
-        # travel and right before the release. None: the gripper reading alone decides (simulation: the weld is
-        # the truth). A check that fails aborts the carry: open, rise, mark again, pick again where it lies now.
-        self.held_check: Callable[[Any, dict[str, np.ndarray], str], tuple[bool, float]] | None = None
         if self.log_dir:
             (self.log_dir / "images").mkdir(parents=True, exist_ok=True)
 
@@ -1592,8 +1554,7 @@ class TwoTierRunner:
                         if cmd == "SUBTASK_DONE" or cmd == "RELEASE":
                             break  # auto-advance to the next queued subtask
                         if cmd == "GRASP":
-                            jaw_held = env.held
-                            if jaw_held and self._held("grasp", write, images, sub, res):
+                            if env.held:
                                 if self.guide is not None:
                                     self.guide.on_grasp(env)
                                 break
@@ -1605,9 +1566,6 @@ class TwoTierRunner:
                             self._recover()
                             reason = (
                                 "GRASP closed on nothing; harness opened the gripper and raised it to ~9 cm"
-                                if not jaw_held
-                                else "GRASP closed, but the wrist camera does not show the object between the "
-                                "fingers; harness opened the gripper and raised it to ~9 cm"
                             )
                             if same:
                                 reason += f"; same spot as missed attempt(s) {same} — change the approach"
@@ -1772,8 +1730,6 @@ class TwoTierRunner:
                 up = TRANSPORT_Z - float(env.tcp_pos[2])
                 if up > 0.01:
                     env.move_relative(np.array([0.0, 0.0, up]))
-                if not self._held("lift", write, None, sub, res):
-                    return self._dropped(sub, res, event, write, "lift")
                 # level travel to above the place; the descent to the release height follows the next look
                 r = self.guide.goto(env, "bin", TRANSPORT_Z)
                 env.precise = True
@@ -1793,8 +1749,6 @@ class TwoTierRunner:
                     event(sub, "escalated", f"overhead guide: {r.reason}", 1)
                     res.escalations += 1
                     return "escalated"
-                if not self._held("travel", write, None, sub, res):
-                    return self._dropped(sub, res, event, write, "travel")
                 env.precise = False
                 env.move_relative(np.array([0.0, 0.0, RELEASE_Z - float(env.tcp_pos[2])]))
                 env.precise = True
@@ -1807,8 +1761,6 @@ class TwoTierRunner:
             if z is not None:
                 env.precise = True  # set it down gently at the right height
                 env.move_relative(np.array([0.0, 0.0, z - float(env.tcp_pos[2])]), from_measured=True)
-            if where != "here" and not self._held("release", write, None, sub, res):
-                return self._dropped(sub, res, event, write, "release")
             env.open_gripper()
             if z is not None:
                 env.precise = False
@@ -1824,74 +1776,6 @@ class TwoTierRunner:
         # the bin the guide was set up with (not guessed from the names: a carrot listed before the bin was once
         # taken for the bin)
         return getattr(self.guide, "bin_name", "bin")
-
-    def _held(
-        self,
-        where: str,
-        write: Any,
-        images: dict[str, np.ndarray] | None,
-        sub: Subtask,
-        res: TwoTierResult,
-    ) -> bool:
-        """Is the object really held? The gripper reading first, then the installed visual check (logged)."""
-        env = self.env
-        if not env.held:
-            return False
-        if self.held_check is None:
-            return True
-        imgs = images if images else env.render_all()
-        t0 = time.perf_counter()
-        try:
-            held, p = self.held_check(env, imgs, where)
-        except Exception as e:  # noqa: BLE001 - a lost query must not end the task: the gripper reading stands
-            write({"type": "held_check", "where": where, "held": True, "p_yes": None, "error": str(e)})
-            print(f"  held check ({where}) failed: {e}", flush=True)
-            return True
-        write(
-            {
-                "type": "held_check",
-                "decision": res.decisions,
-                "subtask": sub.name,
-                "where": where,
-                "held": bool(held),
-                "p_yes": round(float(p), 3),
-                "latency_s": round(time.perf_counter() - t0, 2),
-                "tcp": np.round(env.tcp_pos, 4).tolist(),
-                "images": self._save(
-                    f"ep{res.episode:04d}_held{res.held_checks:02d}_{where}",
-                    {k: v for k, v in imgs.items() if k == "wrist"},
-                    sub,
-                ),
-            }
-        )
-        res.held_checks += 1
-        print(f"  held check ({where}): {'held' if held else 'NOT held'}, p {p:.2f}", flush=True)
-        return bool(held)
-
-    def _dropped(self, sub: Subtask, res: TwoTierResult, event: Any, write: Any, where: str) -> str:
-        """The held check failed during the carry: the object is lost. Open and rise, mark the scene afresh in
-        the background, and let the planner start again from the pick (the object lies somewhere else now)."""
-        res.drops += 1
-        self._recover()
-        pick = sub.task_index
-        restart = getattr(self.planner, "restart_index", None)
-        if restart is not None:
-            pick = restart(sub.task_index)
-        if self.guide is not None:
-            self.guide.reset()
-            try:
-                self.guide.start_background(self.env, kind="begin")  # goto_cube waits for it
-            except Exception as e:  # noqa: BLE001 - goto_cube then marks in the foreground
-                print("  could not start the overhead mark after the drop:", e, flush=True)
-        event(
-            replace(sub, task_index=pick),
-            "dropped",
-            f"the object was lost by the {where} (the wrist camera does not show it between the fingers); "
-            "harness opened the gripper and raised it, and the scene is marked again -- pick it up again where "
-            "it lies now",
-            0,
-        )
-        return "dropped"
 
     def _recover(self) -> None:
         self.env.open_gripper()

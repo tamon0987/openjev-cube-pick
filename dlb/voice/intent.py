@@ -27,7 +27,7 @@ Operations:
 
 Rules:
 - Use only the object names listed below ("bin" is the container things are put into). Map the user's words to them
-  by meaning, kind, colour or sound: the words are usually Japanese and name things loosely (ビン/箱/ゴミ箱 -> the bin).
+  by meaning, kind, colour or sound: the words are usually Japanese and name things loosely (ビン/箱/ゴミ箱/トレイ/トレー/容器/皿 -> the bin).
 - それ / これ / 持っているもの refers to the object in the gripper.
 - The gripper holds at most one object. If a task needs the gripper but it is (or will be) holding something, first place
   that object as the user said; if the user did not say where, place it "here".

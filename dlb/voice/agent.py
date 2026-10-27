@@ -121,6 +121,23 @@ class Agent:
             raise SystemExit("no objects or no container found on the table: pass --objects / --bin-name")
         self.state = RobotState(self.state.held, [*self.objects, "bin"], [], self.state.place_name)
 
+    def refresh_objects(self) -> list[str]:
+        """Look at the table again and add objects that were not there at start-up (a pen put down later);
+        the marker and the parser then know them. Returns the names added."""
+        from dlb.harness.marking import OverheadMarker
+
+        objects, _ = OverheadMarker(model=self.args.mark_model).list_objects(
+            self.env.overhead_frame(), flat=self.args.flat_place
+        )
+        new = [o for o in objects if o != self.args.bin_name and o not in self.objects]
+        if new:
+            self.objects = [*self.objects, *new]
+            self.state = RobotState(self.state.held, [*self.objects, "bin"], [], self.state.place_name)
+            if self.guide is not None:
+                self.guide.marker.names = (*self.objects, self.args.bin_name)
+            print(f"  new on the table: {', '.join(new)}", flush=True)
+        return new
+
     def idle_mark(self) -> None:
         """Mark everything now (background) so the next instruction starts from fresh marks."""
         if self.guide is None or self.guide.pending:

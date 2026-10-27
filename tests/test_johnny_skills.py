@@ -264,7 +264,21 @@ def test_rig_status_unknown_camera_suggests_identify(fake, ctx):
     assert r.data["checks"]["camera wrist"] is False and "identify_cameras" in r.data["suggest"]
 
 
+def confirm_setup_devices(ctx):
+    """A prior successful identification, for tests exercising service start-up only."""
+    cfg = rig.load_config(ctx.robot_config)
+    rig.save_rig(
+        arms={"follower": {"by_id": ARM_A}, "leader": {"by_id": ARM_B}},
+        cameras={
+            "wrist": cfg["cameras"]["wrist"]["device"],
+            "front": cfg["cameras"]["front"]["device"],
+            "rotate": cfg["cameras"]["front"].get("rotate", 0),
+        },
+    )
+
+
 def test_rig_setup_starts_what_is_missing(fake, ctx):
+    confirm_setup_devices(ctx)
     fake.docker["openjev"] = "exited"  # container exists -> docker start
     r = setup.RigSetup().run(ctx)
     assert [s[0] for s in fake.spawned] == ["follower"]
@@ -284,12 +298,14 @@ def test_rig_setup_starts_what_is_missing(fake, ctx):
 
 
 def test_rig_setup_only_what_was_asked(fake, ctx):
-    r = setup.RigSetup().run(ctx, start=["stt"])
+    r = setup.RigSetup().run(ctx, start=["stt"], robot=False)
     assert fake.spawned == [] and fake.docker["openjev"] is None
     assert ["bash", "scripts/stt_server.sh"] in fake.commands and r.data["checks"]["follower"] is False
 
 
 def test_rig_setup_follower_launch_dies(fake, ctx, monkeypatch):
+    confirm_setup_devices(ctx)
+
     def spawn(ctx_, name, cmd, env):
         p = FakePopen()
         p.returncode = 1
@@ -304,7 +320,8 @@ def test_rig_setup_follower_launch_dies(fake, ctx, monkeypatch):
 def test_rig_setup_no_follower_port(fake, ctx):
     fake.ports = {}
     r = setup.RigSetup().run(ctx, start=["follower"])
-    assert not r.ok and "no follower arm port" in r.text and r.data["ask_user"]
+    assert r.ok and "2台をUSB接続" in r.text and r.data["ask_user"]
+    assert not fake.spawned
 
 
 def test_rig_shutdown_is_the_safe_stop_sequence(fake, ctx):
@@ -642,12 +659,6 @@ class FakeAgent:
         self.executed.append((tasks, self.runner.max_decisions))
         self.runner.run(self.episode, seed=0, reset=False, keep_marks=True)  # as Agent.execute does
         self.episode += 1
-        check = self.runner.held_check
-        if check is not None:  # what the runner's checks would have recorded along the carry
-            check.records.extend(
-                {"where": w, "p_yes": p}
-                for w, p in zip(("grasp", "lift", "travel", "release"), (0.95, 0.9, 0.88, 0.97), strict=True)
-            )
         self.state = self.state.__class__("carrot" if self.env.held else None, self.state.objects, [])
         self.idle_mark()
 
@@ -691,9 +702,7 @@ def test_pick_place_starts_the_robot_once_and_runs_the_tasks(fake, ctx, agent):
         and "done: pick carrot, place bin" in r.text
     )
     assert r.data["stop_reason"] == "planner_complete" and "7 decisions" in r.text  # the wrapped runner.run
-    # the visual held check was installed on the runner with the policy's own backend, and the place verified
-    assert a.runner.held_check is not None and a.runner.held_check.be is a.runner.policy.be
-    assert "held confirmed by the wrist camera (4 checks, lowest p 0.88)" in r.text
+    assert a.runner.held_check is None  # no visual held check is installed
     assert "placed, confirmed by the overhead image: the carrot is in the white tray" in r.text
     assert r.data["verified"] is True and r.data["attempts"] == 1 and a.guide.joined == 1
     assert a.guide.pending == "begin"  # the idle mark was started again after the one used for the check
@@ -1097,6 +1106,7 @@ def test_relay_approach_time_follows_the_distance(tmp_path):
 # set-up starts the robot; the place is verified; the safe stop
 # ------------------------------------------------------------------ #
 def test_rig_setup_starts_and_calibrates_the_robot(fake, ctx, agent):
+    confirm_setup_devices(ctx)
     fake.http[f"{rig.STT_URL}/health"] = True
     r = setup.RigSetup().run(ctx)
     assert r.ok, r.text
@@ -1111,6 +1121,7 @@ def test_rig_setup_starts_and_calibrates_the_robot(fake, ctx, agent):
 
 
 def test_rig_setup_without_the_robot(fake, ctx, agent):
+    confirm_setup_devices(ctx)
     fake.http[f"{rig.STT_URL}/health"] = True
     r = setup.RigSetup().run(ctx, robot=False)
     assert agent == [] and ctx.robot is None and "robot" not in r.data["checks"]
@@ -1118,6 +1129,8 @@ def test_rig_setup_without_the_robot(fake, ctx, agent):
 
 
 def test_rig_setup_reports_a_failed_robot_start(fake, ctx, monkeypatch):
+    confirm_setup_devices(ctx)
+
     def build(args):
         a = FakeAgent(args)
         a.fail_start = True
@@ -1146,7 +1159,7 @@ def test_pick_place_not_confirmed_retries_once_and_says_so(fake, ctx, agent):
         "the carrot is NOT in the white tray: it lies at (15, 15) cm on the table, 7 cm from the white tray"
         in r.text
     )
-    assert "2 attempts" in r.text and "held confirmed by the wrist camera (8 checks" in r.text
+    assert "2 attempts" in r.text and "held confirmed by the wrist camera" not in r.text
     recs = [json.loads(ln) for ln in (a.runner.log_dir / "ep0002.jsonl").read_text().splitlines()]
     assert recs[-1]["type"] == "verify" and recs[-1]["ok"] is False and recs[-1]["distance_cm"] == 7.1
 
@@ -1254,3 +1267,114 @@ def test_safe_stop_gives_up_on_a_task_that_does_not_end(fake, ctx, agent, monkey
     assert (
         not r.ok and "still running" in r.text and ctx.robot is not None and agent[0].env.calls[-1] == "start"
     )
+
+
+def test_setup_dialogue_follower_then_wrist_then_start(fake, ctx, agent):
+    fake.joint_states = False
+    fake.http[f"{rig.STT_URL}/health"] = True
+    skill = setup.RigSetup()
+    r = skill.run(ctx)
+    assert r.data["next"] == "follower_unplugged" and "フォロワー" in r.text
+    assert not fake.spawned and not agent
+    # Saying "done" while neither device disappeared must not advance.
+    r = skill.run(ctx, step=r.data["next"])
+    assert r.data["next"] == "follower_unplugged"
+    del fake.ports[ARM_A]
+    r = skill.run(ctx, step=r.data["next"])
+    assert r.data["next"] == "follower_plugged"
+    assert not rig.RIG_JSON.exists()
+    fake.ports[ARM_A] = "/dev/ttyACM3"
+    r = skill.run(ctx, step=r.data["next"])
+    assert r.data["next"] == "camera_wrist_unplugged"
+    assert "手首カメラ" in r.text and not fake.spawned and not agent
+    fake.cameras.remove(WRIST)
+    r = skill.run(ctx, step=r.data["next"])
+    assert r.data["next"] == "camera_plugged"
+    r = skill.run(ctx, step=r.data["next"])
+    assert r.data["next"] == "camera_plugged" and not fake.spawned
+    fake.cameras.append(WRIST)
+    r = skill.run(ctx, step=r.data["next"])
+    assert r.data["next"] == "camera_rotation" and not fake.spawned
+    r = skill.run(ctx, step=r.data["next"], rotate=180)
+    assert r.ok, r.text
+    assert len(agent) == 1
+    assert "port_name:=/dev/ttyACM3" in fake.spawned[0][1]
+    assert rig.load_rig()["arms"]["follower"]["by_id"] == ARM_A
+    assert rig.load_rig()["cameras"]["wrist"].endswith(WRIST)
+    assert "rig_setup_dialogue" not in ctx.state
+
+
+def test_setup_remembers_robot_false_and_cancel_does_not_guess(fake, ctx):
+    skill = setup.RigSetup()
+    r = skill.run(ctx, start=["follower"], robot=False)
+    assert r.data["next"] == "follower_unplugged"
+    del fake.ports[ARM_A]
+    r = skill.run(ctx, step="follower_unplugged")
+    assert r.data["next"] == "follower_plugged"
+    skill.cancel(ctx)
+    assert not rig.RIG_JSON.exists() and not fake.spawned
+    fake.ports[ARM_A] = "/dev/ttyACM2"
+    skill.run(ctx, start=["follower"], robot=False)
+    del fake.ports[ARM_A]
+    skill.run(ctx, step="follower_unplugged")
+    fake.ports[ARM_A] = "/dev/ttyACM4"
+    r = skill.run(ctx, step="follower_plugged")
+    assert "robot" not in r.data["checks"]
+    assert [s[0] for s in fake.spawned] == ["follower"]
+    assert "port_name:=/dev/ttyACM4" in fake.spawned[0][1]
+    assert not fake.commands  # remembered start=[follower], no other services launched
+
+
+def test_setup_saved_ids_follow_port_changes(fake, ctx):
+    confirm_setup_devices(ctx)
+    fake.ports = {ARM_A: "/dev/ttyACM7", ARM_B: "/dev/ttyACM0"}
+    r = setup.RigSetup().run(ctx, start=["follower"], robot=False)
+    assert "ask_user" not in r.data
+    assert "port_name:=/dev/ttyACM7" in fake.spawned[0][1]
+
+
+def test_setup_unknown_single_arm_does_not_assume_follower(fake, ctx):
+    fake.ports = {ARM_B: "/dev/ttyACM0"}
+    r = setup.RigSetup().run(ctx, robot=False)
+    assert r.data["next"] == "start"
+    assert not fake.spawned and not rig.RIG_JSON.exists()
+
+
+def test_setup_does_not_request_unplug_while_driver_runs(fake, ctx):
+    ctx.processes["follower"] = FakePopen()
+    r = setup.RigSetup().run(ctx)
+    assert not r.ok and "ドライバが起動中" in r.text
+    assert not fake.spawned and not r.data
+
+
+def test_setup_cancel_camera_dialogue_keeps_confirmed_arms(fake, ctx):
+    skill = setup.RigSetup()
+    skill.run(ctx)
+    del fake.ports[ARM_A]
+    skill.run(ctx, step="follower_unplugged")
+    fake.ports[ARM_A] = "/dev/ttyACM2"
+    r = skill.run(ctx, step="follower_plugged")
+    assert r.data["next"] == "camera_wrist_unplugged"
+    before = rig.load_config(ctx.robot_config)
+    skill.run(ctx, step="cancel")
+    assert not ctx.state.get("identify_cameras") and "rig_setup_dialogue" not in ctx.state
+    assert rig.load_config(ctx.robot_config) == before
+    assert rig.load_rig()["arms"]["follower"]["by_id"] == ARM_A
+    assert not fake.spawned
+
+
+def test_setup_saved_follower_missing_never_falls_back_to_leader(fake, ctx):
+    confirm_setup_devices(ctx)
+    fake.ports = {ARM_B: "/dev/ttyACM0"}
+    r = setup.RigSetup().run(ctx, start=["follower"], robot=False)
+    assert r.data["next"] == "start" and not fake.spawned
+
+
+def test_setup_existing_driver_on_wrong_port_blocks_start(fake, ctx):
+    confirm_setup_devices(ctx)
+    fake.ports[ARM_A] = "/dev/ttyACM4"
+    ctx.processes["follower"] = FakePopen()
+    ctx.state["follower_port"] = "/dev/ttyACM0"
+    r = setup.RigSetup().run(ctx)
+    assert not r.ok and "一致しません" in r.text
+    assert not fake.spawned

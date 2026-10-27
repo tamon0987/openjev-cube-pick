@@ -64,6 +64,7 @@ class RealOMX(PickPlaceEnv):
         self.table_z = float(self.cfg.get("z_floor_m") or 0.0)
         # tcp height for reach/align of the cube with the real wrist camera (the servo climbs there first)
         self.observe_z = self.cfg.get("observe_z")
+        self.cross_offset_fwd = float(self.cfg.get("grasp_cross_offset_m", 0.0) or 0.0)
         self._start_ros()
         # hold whatever the gripper does now: a default "open" target dropped a held cube on start-up
         _, g = self.measured()
