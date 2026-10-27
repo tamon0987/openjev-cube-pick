@@ -7,6 +7,7 @@ import json
 import os
 import pkgutil
 import signal
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,8 @@ import pytest
 import dlb.johnny.skills as skills_pkg
 from dlb.johnny.skills import calibrate, control, identify, pick_place, rig, setup, teleop
 from dlb.johnny.skills.base import Context, Skill, SkillResult
+from dlb.johnny.teleop_relay import Relay, Settings
+from dlb.real.omx_kinematics import OmxKinematics
 
 REPO = Path(__file__).resolve().parents[1]
 WRIST = "usb-Innomaker_Innomaker-U20CAM-720P_SN0001-video-index0"
@@ -392,23 +395,88 @@ def test_identify_arms_one_arm_only(fake, ctx):
 
 
 # ------------------------------------------------------------------ #
-# teleop
+# teleop (relay + leader launch)
 # ------------------------------------------------------------------ #
-def test_teleop_start_launches_follower_then_leader(fake, ctx):
+@pytest.fixture
+def relay_phase(fake, monkeypatch):
+    """The relay's status file as the teleop skill sees it; the test sets ``fake.relay``."""
+    fake.relay = {
+        "phase": "following",
+        "reason": "moving 17 deg at most in 2.0 s",
+        "messages_out": 98,
+        "clamped": 3,
+    }
+    monkeypatch.setattr(teleop, "relay_status", lambda: fake.relay)
+    return fake
+
+
+def test_teleop_start_launches_follower_relay_and_leader(relay_phase, ctx):
+    fake = relay_phase
     r = teleop.TeleopStart().run(ctx)
-    assert r.ok and ctx.state["teleop"] and ctx.state["arm_moved_externally"]
-    assert [s[0] for s in fake.spawned] == ["follower", "leader"]
-    assert (
-        fake.spawned[1][1]
-        == "ros2 launch open_manipulator_bringup omx_l_leader_ai.launch.py port_name:=/dev/ttyACM1"
+    assert r.ok, r.text
+    assert ctx.state["teleop"] and ctx.state["arm_moved_externally"]
+    assert [s[0] for s in fake.spawned] == ["follower", "relay", "leader"]
+    relay_cmd, leader_cmd = fake.spawned[1][1], fake.spawned[2][1]
+    assert relay_cmd.startswith(f"{sys.executable} -m dlb.johnny.teleop_relay --config {ctx.robot_config}")
+    assert "--raw /leader/joint_trajectory_raw" in relay_cmd and "--status" in relay_cmd
+    assert leader_cmd == (
+        f"ros2 launch {teleop.LAUNCH_FILE} port_name:=/dev/ttyACM1 raw_topic:=/leader/joint_trajectory_raw"
     )
-    assert "mirrors the leader" in r.text and "clear" in r.text
-    assert any("手を離して" in s for s in ctx.said)
+    assert teleop.LAUNCH_FILE.exists() and fake.spawned[2][2] == "42"
+    assert "reached the leader's pose" in r.text and "clear" in r.text and "1.0 rad/s" in r.text
+    assert any("ゆっくり" in s for s in ctx.said)
     r = teleop.TeleopStart().run(ctx)
-    assert "already on" in r.text
+    assert "following the leader" in r.text and "98 commands" in r.text
+    assert "following the leader" in teleop.TeleopStatus().run(ctx).text
     r = teleop.TeleopStop().run(ctx)
-    assert fake.stopped == ["leader"] and ctx.state["teleop"] is False and "holds its pose" in r.text
+    assert fake.stopped == ["relay", "leader"] and ctx.state["teleop"] is False and "holds its pose" in r.text
     assert teleop.TeleopStop().run(ctx).text == "tele-operation was not running"
+    assert teleop.TeleopStatus().run(ctx).text == "tele-operation off"
+
+
+def test_teleop_start_refused_approach_stops_everything(relay_phase, ctx):
+    fake = relay_phase
+    fake.joint_states = True
+    fake.relay = {
+        "phase": "refused",
+        "reason": "the leader's pose [0.0, -1.86, ...] is outside the follower's joint limits",
+    }
+    r = teleop.TeleopStart().run(ctx)
+    assert not r.ok and "refused the approach" in r.text and "joint limits" in r.text
+    assert fake.stopped == ["relay", "leader"] and ctx.state["teleop"] is False
+    assert not ctx.running("relay") and not ctx.running("leader")
+
+
+def test_teleop_start_times_out_without_a_leader_stream(relay_phase, ctx, monkeypatch):
+    fake = relay_phase
+    fake.joint_states = True
+    fake.relay = {"phase": "waiting"}
+    clock = iter(range(0, 100000, 10))
+    monkeypatch.setattr(teleop.time, "monotonic", lambda: float(next(clock)))
+    r = teleop.TeleopStart().run(ctx)
+    assert (
+        not r.ok
+        and "did not start" in r.text
+        and "relay waiting" in r.text
+        and fake.stopped == ["relay", "leader"]
+    )
+
+
+def test_teleop_start_says_approach_once_and_waits_for_following(relay_phase, ctx, monkeypatch):
+    fake = relay_phase
+    fake.joint_states = True
+    phases = iter(
+        [
+            {"phase": "waiting"},
+            {"phase": "approach", "reason": "moving 40 deg at most in 2.0 s"},
+            {"phase": "approach"},
+            {"phase": "following", "reason": "moving 40 deg at most in 2.0 s"},
+        ]
+    )
+    monkeypatch.setattr(teleop, "relay_status", lambda: next(phases))
+    r = teleop.TeleopStart().run(ctx)
+    assert r.ok and "40 deg" in r.text
+    assert sum(s.endswith("ゆっくり動きます。") for s in ctx.said) == 1
 
 
 def test_teleop_start_refused_during_a_task_or_without_leader(fake, ctx):
@@ -421,18 +489,30 @@ def test_teleop_start_refused_during_a_task_or_without_leader(fake, ctx):
     assert not r.ok and "leader arm" in r.text and fake.spawned == []
 
 
-def test_teleop_start_dead_launch(fake, ctx, monkeypatch):
+def test_teleop_start_dead_launch(relay_phase, ctx, monkeypatch):
+    fake = relay_phase
     fake.joint_states = True
+    fake.relay = {"phase": "waiting"}
 
     def spawn(ctx_, name, cmd, env):
         p = FakePopen()
-        p.returncode = 2
+        if name == "leader":
+            p.returncode = 2
         ctx_.processes[name] = p
         return p
 
     monkeypatch.setattr(rig, "spawn", spawn)
     r = teleop.TeleopStart().run(ctx)
-    assert not r.ok and "exited right away" in r.text and not ctx.state["teleop"]
+    assert not r.ok and "leader launch exited" in r.text and not ctx.state["teleop"]
+
+
+def test_teleop_line_reports_a_broken_pair(relay_phase, ctx):
+    ctx.processes["leader"] = FakePopen()
+    assert "BROKEN: the relay is not running" in teleop.teleop_line(ctx)
+    ctx.processes["relay"] = FakePopen()
+    assert teleop.teleop_line(ctx).startswith("tele-operation on: following")
+    relay_phase.relay = {"phase": "paused"}
+    assert "paused" in control.Status().run(ctx).text
 
 
 # ------------------------------------------------------------------ #
@@ -774,7 +854,7 @@ def test_stop_all_cancels_the_task_and_ends_teleop(fake, ctx):
 
 def test_status_line(fake, ctx):
     fake.http = {f"{rig.OPENJEV_URL}/health": True}
-    ctx.processes["leader"] = FakePopen()
+    ctx.processes["leader"], ctx.processes["relay"] = FakePopen(), FakePopen()
     ctx.state["identify_arms"] = {"seen": {}}
     r = control.Status().run(ctx)
     assert isinstance(r, SkillResult) and r.ok
@@ -786,7 +866,7 @@ def test_status_line(fake, ctx):
     )
     assert (
         "cameras wrist, front" in r.text
-        and "launched: leader" in r.text
+        and "launched: leader, relay" in r.text
         and "in progress: identify_arms" in r.text
     )
     assert r.data["ports"]["follower"] == "/dev/ttyACM0" and r.data["teleop"] is True
@@ -794,3 +874,137 @@ def test_status_line(fake, ctx):
         state=SimpleNamespace(held="carrot"), env=SimpleNamespace(held=True, _stamp=0.0)
     )
     assert "holding carrot" in control.Status().run(ctx).text
+
+
+# ------------------------------------------------------------------ #
+# the relay's logic (no ROS)
+# ------------------------------------------------------------------ #
+JOINTS = ["joint1", "joint2", "joint3", "joint4", "joint5"]
+LEADER_ORDER = [
+    "joint2",
+    "joint3",
+    "joint1",
+    "joint4",
+    "joint5",
+    "gripper_joint_1",
+]  # as the broadcaster sends
+
+
+def leader_msg(q, grip):
+    d = dict(zip(JOINTS, q, strict=True))
+    return LEADER_ORDER, [d.get(n, grip) for n in LEADER_ORDER]
+
+
+class Clock:
+    def __init__(self):
+        self.t = 100.0
+
+    def __call__(self):
+        return self.t
+
+
+def make_relay(tmp_path, **over):
+    cfg = {
+        "arm_joints": JOINTS,
+        "gripper_joint": "gripper_joint_1",
+        "gripper_open": 0.45,
+        "gripper_closed": 0.0,
+    }
+    sent = []
+    clock = Clock()
+    relay = Relay(
+        Settings.from_config(cfg, **over),
+        OmxKinematics(),
+        lambda q, g, t: sent.append((list(q), g, t)),
+        now=clock,
+        status_path=tmp_path / "s.json",
+    )
+    return relay, sent, clock
+
+
+def test_relay_approaches_slowly_then_follows_with_a_velocity_limit(tmp_path):
+    relay, sent, clock = make_relay(tmp_path)
+    follower = [0.0, -0.5, 0.7, 0.6, 0.0]
+    relay.on_leader(*leader_msg([0.0, -0.9, 0.7, 0.6, 0.0], -0.29))  # before the follower is known: waits
+    assert relay.phase == "waiting" and sent == []
+    relay.on_follower([*JOINTS, "gripper_joint_1"], [*follower, 0.4])
+    relay.on_leader(*leader_msg([0.0, -0.9, 0.7, 0.6, 0.0], -0.29))
+    assert relay.phase == "approach" and len(sent) == 1
+    q, g, t = sent[0]
+    assert (
+        q == [0.0, -0.9, 0.7, 0.6, 0.0] and g == 0.0 and t == pytest.approx(2.0)
+    )  # 0.4 rad < 2 s x 0.4 rad/s
+    assert "23 deg" in relay.reason
+    # more leader messages during the approach: nothing is sent until it is over
+    clock.t += 1.0
+    relay.on_leader(*leader_msg([0.0, -0.9, 0.7, 0.6, 0.0], -0.29))
+    assert len(sent) == 1
+    clock.t += 1.6  # 2.0 s + 0.5 s margin passed
+    relay.tick()
+    assert relay.phase == "following"
+    # the leader jumps 0.3 rad on joint1: forwarded 0.02 rad per message at most, 50 Hz
+    for i in range(1, 6):
+        clock.t += 0.02
+        relay.on_leader(*leader_msg([0.3, -0.9, 0.7, 0.6, 0.0], 0.7))
+        assert sent[-1][0][0] == pytest.approx(0.02 * i) and sent[-1][2] == pytest.approx(0.02)
+        assert sent[-1][1] == 0.45  # gripper beyond open: clamped
+    assert relay.n_clamped == 5 and len(sent) == 6
+    # messages faster than the rate are dropped
+    relay.on_leader(*leader_msg([0.3, -0.9, 0.7, 0.6, 0.0], 0.2))
+    assert len(sent) == 6
+    # the status file (written at most twice a second)
+    clock.t += 0.5
+    relay.on_follower(JOINTS, follower)  # the follower's joint states keep coming
+    relay.tick()
+    st = json.loads((tmp_path / "s.json").read_text())
+    assert (
+        st["phase"] == "following"
+        and st["messages_out"] == 6
+        and st["clamped"] == 5
+        and st["gripper"] == 0.45
+    )
+    assert st["leader_q"][0] == 0.3 and st["cmd_q"][0] == pytest.approx(0.1)
+
+
+def test_relay_refuses_poses_outside_the_limits_or_too_low(tmp_path):
+    relay, sent, clock = make_relay(tmp_path)
+    relay.on_follower(JOINTS, [0.0, -0.5, 0.7, 0.6, 0.0])
+    relay.on_leader(*leader_msg([0.0, -1.86, 0.7, 0.6, 0.0], 0.0))  # joint2 past the firmware limit
+    assert relay.phase == "refused" and "joint limits" in relay.reason and sent == []
+    assert json.loads((tmp_path / "s.json").read_text())["phase"] == "refused"
+    relay, sent, clock = make_relay(tmp_path)
+    relay.on_follower(JOINTS, [0.0, -0.5, 0.7, 0.6, 0.0])
+    low = [0.0, 1.2, 0.9, 0.5, 0.0]  # arm stretched out and down: fingertips below the base plane
+    assert OmxKinematics().within_limits(np.array(low)) and OmxKinematics().fk(np.array(low))[0][2] < 0.02
+    relay.on_leader(*leader_msg(low, 0.0))
+    assert relay.phase == "refused" and "floor" in relay.reason and sent == []
+
+
+def test_relay_pauses_without_leader_data_and_resumes(tmp_path):
+    relay, sent, clock = make_relay(tmp_path)
+    relay.on_follower(JOINTS, [0.0, -0.5, 0.7, 0.6, 0.0])
+    relay.on_leader(*leader_msg([0.0, -0.5, 0.7, 0.6, 0.0], 0.3))
+    clock.t += 3.0
+    relay.tick()
+    assert relay.phase == "following"
+    clock.t += 0.6  # no leader message for 0.6 s
+    relay.tick()
+    assert relay.phase == "paused"
+    relay.on_follower(JOINTS, [0.0, -0.5, 0.7, 0.6, 0.0])
+    relay.on_leader(*leader_msg([0.0, -0.5, 0.7, 0.6, 0.0], 0.3))
+    assert relay.phase == "following" and sent[-1][1] == 0.3
+    # follower joint states gone (driver died): paused, and the leader alone cannot resume it
+    clock.t += 1.5
+    relay.tick()
+    assert relay.phase == "paused"
+    relay.on_leader(*leader_msg([0.0, -0.5, 0.7, 0.6, 0.0], 0.3))
+    assert relay.phase == "paused"
+    relay.stop()
+    assert json.loads((tmp_path / "s.json").read_text())["phase"] == "stopped"
+
+
+def test_relay_approach_time_follows_the_distance(tmp_path):
+    relay, sent, clock = make_relay(tmp_path, approach_speed=0.4)
+    relay.on_follower(JOINTS, [0.0, -0.5, 0.7, 0.6, 0.0])
+    relay.on_leader(*leader_msg([1.6, -0.5, 0.7, 0.6, 0.0], 0.3))  # 1.6 rad on joint1
+    assert sent[0][2] == pytest.approx(4.0) and relay.t_arrive == pytest.approx(clock.t + 4.5)

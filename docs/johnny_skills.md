@@ -74,18 +74,48 @@ LLM が指示を伝え、ユーザーが「抜いた」「挿した」と言っ�
 フォロワー。by-id の名前で `ctx.state["arms"]` と `rig.json` に保存）→ `plugged`（挿し直したあとの `/dev/ttyACMn` を解決）。
 設定ファイルには書きません。フォロワーの launch とテレオペは、この結果からポートを取ります。
 
-## テレオペ（`teleop_start` / `teleop_stop`）
+## テレオペ（`teleop_start` / `teleop_stop` / `teleop_status`）
 
-- リーダーの launch: `ros2 launch open_manipulator_bringup omx_l_leader_ai.launch.py port_name:=/dev/ttyACM1`
-  （launch 引数: `prefix`, `use_sim`, `use_mock_hardware`, `mock_sensor_commands`, `port_name`（既定 `/dev/ttyACM2`）,
-  `ros2_control_type`）。`/leader` 名前空間の `joint_trajectory_command_broadcaster` が、リーダーの関節を
-  `trajectory_msgs/JointTrajectory` として **`/leader/joint_trajectory`** に出します。
-- フォロワーの launch（`omx_f_follower_ai.launch.py`）は `ros2_control_node` の `/arm_controller/joint_trajectory` を
-  `/leader/joint_trajectory` にリマップしているので、両方が上がった瞬間からフォロワーが追従します（リーダーの姿勢へ
-  いきなり動くので、起動前に `ctx.say` で「手を離してください」と伝えます）。`open_manipulator_teleop` パッケージ
-  （`omx_f_teleop` はキーボード操作）や `cyclo_teleoperation` は使いません。
-- 前提: フォロワーのドライバ（なければ起動する）、リーダーのポートがあること。
-- `teleop_stop`: launch のプロセスグループに SIGINT（10 秒待って SIGTERM、SIGKILL）。フォロワーは最後の姿勢を保持。
+ROBOTIS の `omx_l_leader_ai.launch.py` は、`/leader` 名前空間の `joint_trajectory_command_broadcaster` がリーダーの
+関節を `trajectory_msgs/JointTrajectory`（`time_from_start = 0`、100 Hz）として **`/leader/joint_trajectory`** に出し、
+フォロワーの launch（`omx_f_follower_ai.launch.py`）は `ros2_control_node` の `/arm_controller/joint_trajectory` を
+その topic にリマップしています。つまりそのまま上げると、**フォロワーがリーダーの姿勢へ全速で飛びます**（このリグで
+joint2 が -1.86 rad まで飛び、ID 13 / 15 が過負荷エラーになりました）。グリッパーもリーダーの値（`reverse_joints`
+で符号反転した値、閉じ側を越えて -0.29 など）がそのまま届きます。そこで Johnny は直結せず、中継を挟みます。
+
+```
+リーダー launch（dlb/johnny/launch/omx_l_leader_relay.launch.py = ROBOTIS の launch を SetRemap で包む）
+   └─ /leader/joint_trajectory_raw ─▶ python -m dlb.johnny.teleop_relay ─▶ /leader/joint_trajectory ─▶ フォロワー
+                                       ▲ /joint_states（フォロワーの現在値）
+```
+
+- `teleop_start` は、フォロワーのドライバ（なければ起動）→ **中継**（`ctx.processes["relay"]`）→ **リーダーの launch**
+  （`ros2 launch <repo>/dlb/johnny/launch/omx_l_leader_relay.launch.py port_name:=/dev/ttyACM1
+  raw_topic:=/leader/joint_trajectory_raw`、`ctx.processes["leader"]`）の順に起動し、中継の状態ファイル
+  `results/johnny/teleop_status.json` が `following` になるまで（最大 40 秒）待ちます。
+- 中継（`dlb/johnny/teleop_relay.py`、ROS を使わない `Relay` クラス + rclpy の薄い `main`）:
+  1. `waiting`: リーダーの姿勢とフォロワーの `/joint_states` の両方が届くまで何も出さない。
+  2. `approach`: リーダーの姿勢が `OmxKinematics.within_limits`（ファームウェアの関節制限、余裕 0.02 rad）の外、
+     または FK で指先が基準面から 2 cm（`--min-z`）より下なら **拒否**（exit code 3、理由を状態ファイルに書く。
+     `teleop_start` は両プロセスを止めて理由を返す）。通れば、関節距離 / 0.4 rad/s（最短 2 秒、`go_pose` と同じ速さ）
+     の 1 点の軌道でフォロワーをリーダーの姿勢へ**ゆっくり**動かし、到着まで待つ（`ctx.say` で知らせる）。
+  3. `following`: リーダーの各メッセージを 50 Hz（`--rate`）に間引き、前回の指令から各関節 **0.02 rad/メッセージ**
+     （`--max-step`、= 最大 1.0 rad/s）までに刻んで送る。関節は制限内にクランプ、グリッパーは設定の
+     `[gripper_closed, gripper_open]`（0.0〜0.45）にクランプ。
+  4. `paused`: リーダーの stream が 0.5 秒、またはフォロワーの `/joint_states` が 1 秒途切れたら送らない
+     （フォロワーは保持）。戻れば続きから（離れた分は速度制限つきで追いつく）。
+- `teleop_stop` / `stop_all`: 先に中継を止め（SIGINT、送信が止まる）、次にリーダーの launch のプロセスグループに
+  SIGINT（10 秒待って SIGTERM、SIGKILL）。フォロワーは最後の姿勢を保持。
+- `teleop_status` と `status` は状態ファイルから「approaching / following（送った指令数、速度制限が効いた回数）/
+  paused」を 1 行で出し、中継かリーダーの片方だけ死んでいれば BROKEN と言います。
+- フォロワー側のグリッパーの対応づけを launch が変えることはありません（フォロワーの `omx_f.ros2_control.xacro` に
+  反転やオフセットの設定はなく、中継が送るのはクランプ済みの値だけ）。10/1 と符号が逆に読めたのは過負荷停止中の
+  読み値で、電源を入れ直したあとは正常です。
+- `open_manipulator_teleop` パッケージ（`omx_f_teleop` はキーボード操作）や `cyclo_teleoperation` は使いません。
+- 実機では未検証です。検証したのは、(a) 包んだ launch を `use_mock_hardware:=true`・隔離した `ROS_DOMAIN_ID` で上げると
+  `/leader/joint_trajectory_raw` だけが出て `/leader/joint_trajectory` は出ないこと、(b) 中継を `ros2 topic pub` の
+  偽の `/joint_states` と raw stream で動かすと、接近 → 追従（グリッパー -0.29 → 0.0 にクランプ）→ SIGINT で停止
+  まで動くこと、の 2 点です。
 - **排他**: `RealOMX`（pick_place のブリッジ）も同じ `/leader/joint_trajectory` に出すので、
   - タスク実行中（`ctx.state["task_running"]`）は `teleop_start` を拒否、
   - テレオペ中に `pick_place` / `robot_home` / `robot_release` / `calibrate_overhead` を呼ぶと、先にテレオペを止めてから
