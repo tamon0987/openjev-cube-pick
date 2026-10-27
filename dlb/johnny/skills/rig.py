@@ -168,8 +168,8 @@ def joint_states_up(cfg: dict[str, Any], timeout: float = 10.0) -> bool:
     topic = cfg.get("joint_states_topic", "/joint_states")
     r = run(
         ros_shell(f"ros2 topic echo --once --timeout {max(1, int(timeout))} {topic}"),
-        ros_env(cfg),
         timeout + 5,
+        ros_env(cfg),
     )
     return r is not None and r.returncode == 0 and "position" in (r.stdout or "")
 
