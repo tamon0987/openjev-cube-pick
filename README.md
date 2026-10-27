@@ -69,6 +69,7 @@ This code moves a real robot arm.
 | Path | Contents |
 |---|---|
 | `dlb/voice/` | Microphone input and utterance segmentation (`listen.py`), instruction parsing (`intent.py`), the voice agent (`agent.py`) |
+| `dlb/johnny/` | Johnny (experimental): a conversational agent behind the wake word "Hi, Johnny" that keeps the chat history and calls skills (`skills/`) on the rig ([docs/johnny.md](docs/johnny.md)) |
 | `dlb/harness/twotier.py` | Two-tier control with a planner and the decision layer: wrist-camera alignment (binary servo), failure detection and retries |
 | `dlb/harness/marking.py` | VLM marking of the overhead image and online estimation of the table-to-pixel mapping |
 | `dlb/real/` | Bridge to the real OMX-F (rclpy + OpenCV). `omx_kinematics.py` is a port of Show-Harness to the OMX-F |

@@ -1,0 +1,70 @@
+# Johnny: 会話で指示する（実験的）
+
+「Hi, Johnny」と呼びかけてから話すと、LLM（gpt-5.5）がこれまでの会話を踏まえて答え、必要ならスキル（リグのセットアップ、テレオペ、ピック＆プレース、停止）を呼びます。[voice.md](voice.md) のエージェントが「指示 → タスク列」の一方通行なのに対し、Johnny は聞き返しや多段の手順（「USB を抜いてください」→「抜きました」）ができます。
+
+```
+arecord ─▶ Silero VAD ─▶ 文字起こし :8010 ─▶ ウェイクワード判定 ─▶ gpt-5.5（会話履歴 + スキル）─▶ 返事（表示 / 読み上げ）
+          dlb/voice/listen.py                  dlb/johnny/wake.py     dlb/johnny/llm.py, agent.py        dlb/johnny/speak.py
+                                                                       └─▶ スキル dlb/johnny/skills/*.py
+```
+
+## 1. 起動
+
+[voice.md](voice.md) の 1〜2 と同じ準備（`.env` の `OPENAI_API_KEY`、文字起こしサーバー `bash scripts/stt_server.sh`）が済んでいれば:
+
+```bash
+python -m dlb.johnny                       # マイク
+python -m dlb.johnny --text                # キーボードで打つ（ウェイクワードは必要）
+python -m dlb.johnny --file x.wav          # 録音を流す（テスト用。文字起こしサーバーは必要）
+python -m dlb.johnny --tts openai          # 返事を読み上げる（OpenAI TTS → aplay）
+python -m dlb.johnny --debug               # 捨てた発話もログに出す
+```
+
+主なオプション: `--history results/johnny/history.jsonl`（会話履歴ファイル、`--fresh` で読まずに始める）、`--wake-window 8`（ウェイクワードだけ言ったあと待つ秒数）、`--ask-window 20`（スキルが作業を頼んだあと返事を待つ秒数）、`--skills setup,stop`（使うスキルを絞る）、`--model gpt-5.5`、`--effort low`。ログは `results/johnny/johnny_<日時>.log` です。終了は Ctrl+C（動いているスキルを止め、ロボットが起動していれば閉じます）。
+
+ロボットやドライバを動かすのはスキルの仕事です。Johnny 本体はマイクと LLM しか触りません。
+
+## 2. ウェイクワードの規則
+
+- **毎回の依頼は「Hi, Johnny」で始めます。** ウェイクワードがない発話はその場で捨てられ、OpenAI には送られません（`--debug` のときだけログに残ります）。
+- Whisper の書き方のゆれは吸収します: `Hi Johnny` / `hi, johnny` / `Johnny` / `Jonny` / `John` / `ハイ、ジョニー` / `ハイジョニー` / `はいジョニー` / `ジョニー` / `ジョニ` / `ジョーニー` / `ジャニー` / `ジョニーさん` など（`dlb/johnny/wake.py` の `WAKE_FORMS`）。大文字小文字と句読点は無視し、ひらがな・カタカナも同じ扱いです。一覧にない形でも、4 文字以上の形から 1 文字違いなら通します（「ハイジョニィ」など）。先頭の「ねえ」「あ、」「Hey」「OK」は読み飛ばします。
+- **ウェイクワード + 依頼** を一息で言うと、ウェイクワードを除いた残りが依頼になります（「ジョニー、赤いキューブをビンに入れて」）。
+- **ウェイクワードだけ** 言うと「はい、どうぞ」と返し、`--wake-window` 秒（既定 8 秒）の間は次の発話をそのまま依頼として受け取ります。Johnny が聞き返したとき（返事が「？」で終わる）も同じ窓が開くので、答えにウェイクワードは要りません。
+- **スキルが作業を頼んだとき**（例:「手首カメラの USB を抜いてください」）は `--ask-window` 秒（既定 20 秒）の窓が開き、「抜きました」とだけ言えば続きます。ウェイクワード付きで答えてもかまいません。
+- **止める言葉**（止まって / 止めて / ストップ / やめて / 停止 / 待って / stop）はウェイクワードなしで通り、すぐに止めます: 動いているスキルの `cancel()` を呼び、`stop` という名前のスキルがあればそれも実行します。作業を頼まれて返事待ちのときに言えば、そのスキルを取り消して窓を閉じます。「止まってから右に動いて」のように続きがある文は止める言葉とは見なしません。
+- 作業中（スキルの実行中）に別の依頼が来ると「作業中です」と答えて受け付けません。止めるなら止める言葉を言います。
+- 判定のテーブルは `tests/test_johnny.py` の `WAKE_TABLE` にあります。形を増やすときはそこに例を足してください。
+
+## 3. 会話履歴
+
+LLM には毎回、過去の会話をまとめて送ります: ユーザーの発話、Johnny の返事、スキルの呼び出しとその結果。だから「さっきのをもう一度」や多段の手順の続き（どのステップまで済んだか）が分かります。
+
+- 履歴は `--history`（既定 `results/johnny/history.jsonl`、1 行 1 項目）に追記され、次回起動時に読み込まれます。`--fresh` で読まずに始めます（追記はされます）。`--history ""` でファイルを使いません。
+- 送る量は直近 `--max-turns` 回（既定 40）のユーザー発話分、かつ約 6 万文字までに切ります。切るときはユーザー発話の境目で切るので、スキルの呼び出しと結果が別れることはありません。
+- 止める言葉で止めたときも「止まって」「止めました」として履歴に残ります。
+
+## 4. スキルを足す
+
+スキルは `dlb/johnny/skills/` の Python モジュールです。`registry.load()` がそのディレクトリのモジュールをすべて読み込み（`base.py`、`registry.py`、`_` で始まるものを除く）、`Skill` のサブクラスを引数なしで作って名前で登録します。読み込みに失敗したモジュールはログに出して飛ばします。起動時に読み込めたスキルの一覧を表示します。
+
+`dlb/johnny/skills/base.py` の約束:
+
+- `name`、`description`、`parameters`（JSON Schema）を持ち、`run(ctx, **kwargs) -> SkillResult` を実装します。`description` とパラメータの説明は LLM がそのまま読むので、何をするか・いつ使うかを書きます。
+- `run` は **ワーカースレッド** で動きます（メインスレッドはその間も止める言葉を聞いています）。同時に動くスキルは 1 つだけです。シグナルハンドラは登録できません。
+- `cancel(ctx)` は `run` の実行中に **別のスレッドから** 呼ばれます。`run` が速やかに戻るようにしてください（戻り値は「止めた」と分かる `SkillResult(ok=False, ...)` が無難です）。ユーザーに作業を頼んで返事待ちの間に止められたときも `cancel` が呼ばれます。
+- `SkillResult.text` は LLM に渡す結果（短い平文）。`ok=False` なら `[failed]` を付けて渡します。
+- ユーザーに物理的な作業を頼んで続きを待つときは `SkillResult(text="…してください", data={"ask_user": True, "next": "<次のステップ>"})` を返します。Johnny はその指示を伝えて返事の窓を開き、LLM は返事を受けて同じスキルを `next` のステップで呼び直します。ステップは `parameters` の `step` のような enum で表し、`description` に順番を書いておきます。
+- `ctx`（`Context`）: `ctx.say(text)` は LLM を通さずすぐユーザーに伝える進捗、`ctx.log(text)` はログ、`ctx.processes` は起動したプロセス（名前 → `Popen`、`ctx.running(name)`）、`ctx.robot` はピック＆プレースが起動した `dlb.voice.agent.Agent`（終了時に `ctx.robot.env.close()` を呼びます）、`ctx.state` は自由に使える辞書、`ctx.robot_config` / `ctx.env_file` は起動オプション。`say` と `log` はどのスレッドから呼んでも大丈夫です。
+- `tool_spec()` が Responses API の function tool 定義を返します（`strict: False`）。
+
+## 5. 読み上げ
+
+既定では返事を表示するだけです。`--tts openai` で OpenAI の `audio/speech`（`gpt-4o-mini-tts`、`--voice alloy`）で WAV を作り、`aplay`（なければ `paplay`）で鳴らします。音が出せなくても表示だけして続けます。再生中とその直後 0.8 秒に重なった発話はマイクが拾っても捨てるので、Johnny が自分の声に反応することはありません。
+
+## 6. テスト
+
+```bash
+MUJOCO_GL=egl .venv/bin/python -m pytest -q tests/test_johnny.py
+```
+
+ネットワークもロボットも要りません。ウェイクワードの判定表、履歴の切り詰めと保存、スタブの LLM での tool ループ、止める言葉での取り消し、二段階の対話スキルを確かめます。テスト用の偽スキルは `tests/test_johnny.py` の中にあります（`dlb/johnny/skills/` には置きません）。
