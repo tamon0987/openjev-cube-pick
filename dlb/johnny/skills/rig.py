@@ -161,9 +161,17 @@ def ros_topics(cfg: dict[str, Any], timeout: float = 10.0) -> list[str] | None:
 
 
 def joint_states_up(cfg: dict[str, Any], timeout: float = 10.0) -> bool:
-    """A follower driver (ours or one launched in a terminal) publishes the joint states."""
-    topics = ros_topics(cfg, timeout)
-    return topics is not None and cfg.get("joint_states_topic", "/joint_states") in topics
+    """A follower driver (ours or one launched in a terminal) publishes the joint states.
+
+    The topic alone is not enough: a robot_state_publisher left behind by a dead launch subscribes to it, so the
+    topic stays listed with no publisher. Ask for a message instead."""
+    topic = cfg.get("joint_states_topic", "/joint_states")
+    r = run(
+        ros_shell(f"ros2 topic echo --once --timeout {max(1, int(timeout))} {topic}"),
+        ros_env(cfg),
+        timeout + 5,
+    )
+    return r is not None and r.returncode == 0 and "position" in (r.stdout or "")
 
 
 def spawn(ctx: Any, name: str, cmd: str, env: dict[str, str]) -> subprocess.Popen:

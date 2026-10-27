@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -231,7 +233,11 @@ class Johnny:
         for name, p in list(self.ctx.processes.items()):
             if p.poll() is None:
                 self.log(f"terminating {name}")
-                p.terminate()
+                try:  # the whole launch tree (its own session): SIGINT lets the nodes shut the hardware down
+                    os.killpg(p.pid, signal.SIGINT)
+                    p.wait(timeout=10)
+                except Exception:  # noqa: BLE001
+                    p.terminate()
 
 
 # ---------------------------------------------------------------- speech in
