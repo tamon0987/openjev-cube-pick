@@ -258,7 +258,12 @@ def _speech(args: argparse.Namespace, out: queue.Queue, log) -> None:
             mic_frames,
         )
 
-        tr = Transcriber(args.stt_url, args.stt_model) if args.stt_model else Transcriber(args.stt_url)
+        kw = {"prompt": args.stt_prompt or None}  # a short spelling hint for the wake word
+        tr = (
+            Transcriber(args.stt_url, args.stt_model, **kw)
+            if args.stt_model
+            else Transcriber(args.stt_url, **kw)
+        )
         if not tr.health():
             print(
                 f"transcription server not reachable at {args.stt_url} (bash scripts/stt_server.sh)",
@@ -311,6 +316,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-turns", type=int, default=40, help="user turns kept in the history sent")
     ap.add_argument("--tts", choices=["none", "openai"], default="none")
     ap.add_argument("--voice", default="alloy")
+    ap.add_argument(
+        "--stt-prompt",
+        default="Hi, Johnny。ジョニー。",
+        help="spelling hint given to Whisper so the wake word comes out as itself ('' = none)",
+    )
     ap.add_argument("--wake-window", type=float, default=12.0, help="s to speak after a bare wake word")
     ap.add_argument("--ask-window", type=float, default=20.0, help="s to answer when a skill asks something")
     ap.add_argument("--skills", default=None, help="only these skills (comma-separated)")

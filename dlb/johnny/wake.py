@@ -30,6 +30,13 @@ WAKE_FORMS = (
     "ハイジョニー",
     "ハイジョーニー",
     "ハイジャニー",
+    # what Whisper wrote for a Japanese-accented "Hi, Johnny" on the rig (kanji, so no fuzzy katakana match)
+    "排除に",
+    "排除にー",
+    "排除",
+    "廃城",
+    "配所に",
+    "はいじょに",
     "ハイジョニ",
     "ジョニーさん",
     "ジョニーくん",
