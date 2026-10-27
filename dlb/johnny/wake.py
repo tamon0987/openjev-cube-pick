@@ -177,7 +177,7 @@ class WakeWord:
         if hit is None:
             return Match("none")
         end, form = hit
-        rest = text[ends[end - 1] :] if end else text
+        rest = text[ends[min(end, len(ends)) - 1] :] if end else text  # end may run past a short transcript
         # leading punctuation and spaces between the wake word and the command ("ジョニー、取って")
         rest = rest.lstrip(" \t　、。,.!?！？:：;；・…ー-")
         return Match("command" if rest else "wake", rest, form)

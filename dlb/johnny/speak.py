@@ -34,16 +34,19 @@ class Speaker:
         with self._lock:
             print(f"Johnny: {text}", file=self.out, flush=True)
             self.speaking_since = time.monotonic()
+            played = False
             try:
-                self._play(text)
+                played = self._play(text)
             except Exception as e:  # noqa: BLE001 - speech is optional
                 print(f"  (speech failed: {e})", file=sys.stderr)
             finally:
-                self._spans.append((self.speaking_since, time.monotonic()))
+                if played:  # only real playback can be picked up by the microphone
+                    self._spans.append((self.speaking_since, time.monotonic()))
                 self.speaking_since = None
 
-    def _play(self, text: str) -> None:
-        pass
+    def _play(self, text: str) -> bool:
+        """Play ``text`` aloud; return True when audio was actually played."""
+        return False
 
     def overlaps(self, t_start: float, t_end: float) -> bool:
         """Whether an utterance heard between these monotonic times coincides with Johnny's own speech."""
@@ -83,7 +86,7 @@ class OpenAISpeaker(Speaker):
         self.client = client
         self.player = player or find_player()
 
-    def _play(self, text: str) -> None:
+    def _play(self, text: str) -> bool:
         if self.player is None:
             raise RuntimeError("no audio player (aplay or paplay)")
         r = self.client.post(
@@ -95,6 +98,7 @@ class OpenAISpeaker(Speaker):
         p = subprocess.run(self.player, input=r.content, capture_output=True)
         if p.returncode != 0:
             raise RuntimeError(f"{self.player[0]}: {p.stderr.decode(errors='replace').strip()[:200]}")
+        return True
 
 
 def find_player() -> list[str] | None:

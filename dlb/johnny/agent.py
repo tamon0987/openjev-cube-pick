@@ -311,7 +311,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-turns", type=int, default=40, help="user turns kept in the history sent")
     ap.add_argument("--tts", choices=["none", "openai"], default="none")
     ap.add_argument("--voice", default="alloy")
-    ap.add_argument("--wake-window", type=float, default=8.0, help="s to speak after a bare wake word")
+    ap.add_argument("--wake-window", type=float, default=12.0, help="s to speak after a bare wake word")
     ap.add_argument("--ask-window", type=float, default=20.0, help="s to answer when a skill asks something")
     ap.add_argument("--skills", default=None, help="only these skills (comma-separated)")
     ap.add_argument("--robot-config", default="configs/robot/omx_f.yaml")
