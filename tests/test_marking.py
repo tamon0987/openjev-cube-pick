@@ -647,3 +647,13 @@ def test_calibration_fails_loudly():
     with pytest.raises(RuntimeError, match="overhead calibration failed"):
         g.calibrate(env)
     assert g.needs_calibration and not g.map.xy and env.poses[-1] == "begin"  # nothing half-set, arm at begin
+
+
+def test_reachable_rejects_marks_far_outside_the_work_area():
+    from dlb.harness.marking import OverheadGuide
+
+    g = OverheadGuide.__new__(OverheadGuide)
+    g.bounds = ((0.10, 0.30), (-0.20, 0.20))
+    assert g._reachable(np.array([0.22, -0.07]))
+    assert g._reachable(np.array([0.33, 0.22]))  # within the slack
+    assert not g._reachable(np.array([0.349, 0.411]))  # the carrot marked on the laptop

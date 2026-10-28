@@ -819,6 +819,11 @@ class OverheadGuide:
             return True
         return float(np.linalg.norm(self.map.to_px(tcp) - g)) <= self.GRIPPER_OUTLIER_PX
 
+    def _reachable(self, xy: np.ndarray, slack: float = 0.06) -> bool:
+        """Whether a table point lies within the work area (``bounds``) give or take ``slack`` (m)."""
+        lo, hi = [b[0] - slack for b in self.bounds], [b[1] + slack for b in self.bounds]
+        return bool(np.all(np.asarray(xy)[:2] >= lo) and np.all(np.asarray(xy)[:2] <= hi))
+
     def _mark_now(self, env: Any) -> _Shot:
         img, tcp = env.overhead_frame(), env.tcp_pos.copy()
         m = self.marker.mark(img)
@@ -968,6 +973,28 @@ class OverheadGuide:
             px = self.last["bin"]
             rec["bin_marks"] = len(self._bins)
         goal = self.map.to_table(px)
+        if target == "cube" and not self._reachable(goal):
+            # a mark far outside the arm's reach is a wrong mark (the model once put a carrot on the laptop at the
+            # image's left edge, 41 cm out): mark again here before moving, once
+            retry = self._mark_now(env)
+            p2 = self._pt(retry.marks, target)
+            g2 = None if p2 is None else self.map.to_table(p2)
+            rec.update(rejected_goal_xy=np.round(goal, 4).tolist(), remarked=True)
+            print(
+                f"  overhead: {self.roles.get(target, target)} marked out of reach at "
+                f"({goal[0] * 100:.0f}, {goal[1] * 100:.0f}) cm: marking again",
+                flush=True,
+            )
+            if g2 is None or not self._reachable(g2):
+                return GotoResult(
+                    False,
+                    None,
+                    1,
+                    float("nan"),
+                    f"{self.roles.get(target, target)} marked out of the arm's reach twice",
+                    [rec],
+                )
+            shot, px, goal = retry, p2, g2
         here = env.tcp_pos[:2].copy()
         if shot is not None and shot.marks.points.get("gripper") is not None:
             # both marks in the same image: move by their difference from where that image was taken (the map's
