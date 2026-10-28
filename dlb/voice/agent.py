@@ -102,7 +102,22 @@ class Agent:
             "  calibrating the overhead view (the arm visits a few poses around the begin pose)", flush=True
         )
         self.guide.calibrate(self.env)
+        self.park()
         self.idle_mark()
+
+    def park(self) -> None:
+        """To the wait pose (``poses.wait``) when the config has one: the arm out of the overhead view between
+        tasks, so the idle image shows the whole table. Not while holding something."""
+        env = self.env
+        if env is None or not (env.cfg.get("poses") or {}).get("wait") or env.held:
+            return
+        env.go_pose("wait")
+
+    def unpark(self) -> None:
+        """From the wait pose to the begin pose, where every task starts its moves."""
+        env = self.env
+        if env is not None and hasattr(env, "at_pose") and env.at_pose("wait", tol=0.1):
+            env.go_pose("begin")
 
     def discover(self) -> None:
         """Name the objects on the table and the container from the overhead image (the ones not given)."""
@@ -222,8 +237,13 @@ class Agent:
         planner = TaskPlanner(tasks, bin_name=self.args.bin_name)
         self.runner.planner = planner
         t0 = time.perf_counter()
+        self.unpark()  # the idle image (taken at the wait pose) was grabbed already; the mark runs meanwhile
         r = self.runner.run(self.episode, seed=self.episode, reset=False, keep_marks=True)
         self.episode += 1
+        try:
+            self.park()
+        except Exception as e:  # noqa: BLE001 - the arm stays at the begin pose
+            print("  could not go to the wait pose:", e, file=sys.stderr)
         # what the robot holds now: the last picked object if the gripper is closed on something
         held = None
         if self.env.held:

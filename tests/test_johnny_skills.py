@@ -666,6 +666,9 @@ class FakeAgent:
         self.marks += 1
         self.guide.pending = "begin"
 
+    def park(self):
+        self.parked = getattr(self, "parked", 0) + 1
+
     def ensure_fresh_marks(self):
         self.fresh_checks = getattr(self, "fresh_checks", 0) + 1
         return False

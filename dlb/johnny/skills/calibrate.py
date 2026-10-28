@@ -89,5 +89,6 @@ class CalibrateOverhead(Skill):
             return SkillResult(prefix + f"calibration aborted: {e}; the arm holds where it is", ok=False)
         ctx.state.pop("cameras_changed", None)
         ctx.state.pop("arm_moved_externally", None)
+        agent.park()
         agent.idle_mark()
         return SkillResult(prefix + "overhead calibration done: " + describe(rec), data={"calibration": rec})

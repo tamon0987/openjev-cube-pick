@@ -222,3 +222,28 @@ def test_agent_marks_again_before_a_task_when_the_table_changed_since_the_idle_m
     assert a.ensure_fresh_marks() and marked == [1] and a.guide.resets == 1
     a._ref = None  # no idle mark yet: nothing to compare
     assert not a.ensure_fresh_marks()
+
+
+def test_agent_waits_at_the_wait_pose_and_starts_tasks_from_the_begin_pose():
+    from types import SimpleNamespace
+
+    from dlb.voice.agent import Agent
+
+    moves = []
+    env = SimpleNamespace(
+        cfg={"poses": {"wait": [0.0] * 5}},
+        held=False,
+        go_pose=lambda name: moves.append(name),
+        at_pose=lambda name, tol=0.03: bool(moves) and moves[-1] == name,
+    )
+    a = Agent.__new__(Agent)
+    a.env = env
+    a.park()
+    a.unpark()
+    assert moves == ["wait", "begin"]
+    a.unpark()  # not at the wait pose: stays
+    env.held = True
+    a.park()  # holding something: stays
+    env.held, env.cfg = False, {"poses": {}}
+    a.park()  # no wait pose configured: the begin pose stays the home
+    assert moves == ["wait", "begin"]

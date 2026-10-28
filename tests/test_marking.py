@@ -685,3 +685,38 @@ def test_the_place_move_is_never_cut_short():
     r = g.goto(e, "bin", 0.12)
     assert r.ok and r.error_cm > g.max_step
     assert e.tcp_pos[1] > 0.19  # at the work area's edge over the tray, not 10 cm short of it
+
+
+def test_an_image_taken_at_the_wait_pose_places_objects_by_the_map_alone():
+    """At the wait pose the tcp is ~26 cm up: its gripper mark is far off its table point (parallax), so it must
+    not feed the map, and the move goes to the object's mapped point."""
+
+    class M:
+        names = ("green cube", "black bin")
+
+    tmap = TableMap(px_per_m=700.0)
+    g = OverheadGuide(M(), tmap)
+    tmap.add(np.array([0.20, 0.0, 0.09]), np.array([343.0, 330.0]))
+    tmap.add(np.array([0.26, 0.0, 0.09]), np.array([343.0, 288.0]))
+    tmap.add(np.array([0.20, 0.06, 0.09]), np.array([301.0, 330.0]))
+    pairs = len(tmap.xy)
+    pts = {"gripper": np.array([340.0, 380.0]), "green cube": np.array([400.0, 320.0])}
+    g.marker.mark = lambda img: Marks(pts, {k: 1.0 for k in pts}, 0.0, [], {})
+
+    class E:
+        tcp_pos = np.array([0.052, -0.003, 0.257])  # the wait pose
+
+        def overhead_frame(self):
+            return np.zeros((480, 640, 3), np.uint8)
+
+        def _move_tcp(self, target):
+            self.tcp_pos = np.array(target, float)
+
+    e = E()
+    g.start_background(e, kind="begin")
+    e.tcp_pos = np.array([0.186, 0.0, 0.092])  # moved to the begin pose while the mark runs
+    r = g.goto(e, "cube", 0.12)
+    g.join()
+    assert r.ok and r.log[0]["begin_mark"] == "used"
+    assert len(tmap.xy) == pairs  # the parked gripper mark did not enter the map
+    assert np.allclose(e.tcp_pos[:2], tmap.to_table(pts["green cube"]), atol=1e-3)

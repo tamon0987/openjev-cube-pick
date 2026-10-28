@@ -126,6 +126,7 @@ def return_to_begin(ctx: Context, agent: Any) -> None:
     if ctx.state.pop("arm_moved_externally", False):
         ctx.say("はじめの姿勢に戻ります。")
         agent.env.reset(seed=0)
+        agent.park()
         agent.state = replace(agent.state, held=None, queue=[])
         agent.idle_mark()
 
@@ -394,8 +395,9 @@ class PickPlace(Skill):
 class RobotHome(Skill):
     name = "robot_home"
     description = (
-        "Move the robot arm to its begin pose (over the table, camera looking down), gripper as it is. Starts the "
-        "robot when it is not started yet. Use for 'go home', 'はじめの姿勢に', 'ホームに戻って', '元の位置へ'."
+        "Move the robot arm to its waiting pose (pulled back, out of the overhead view; the begin pose when no "
+        "waiting pose is configured), gripper as it is. Starts the robot when it is not started yet. Use for "
+        "'go home', 'はじめの姿勢に', 'ホームに戻って', '元の位置へ', '待機位置に'."
     )
     parameters = {"type": "object", "properties": {}, "additionalProperties": False}
 
@@ -408,15 +410,18 @@ class RobotHome(Skill):
         if agent is None:
             return SkillResult(prefix + err, ok=False)
         if started:
-            return SkillResult(prefix + "the robot started and is at the begin pose", data={"started": True})
+            return SkillResult(
+                prefix + "the robot started and is at its waiting pose", data={"started": True}
+            )
         try:
             ctx.say("はじめの姿勢に動きます。")
             agent.env.go_pose("begin")
+            agent.park()  # on to the waiting pose, when one is configured
             ctx.state.pop("arm_moved_externally", None)
             agent.idle_mark()
         except Exception as e:  # noqa: BLE001
             return SkillResult(prefix + f"could not reach the begin pose: {e}", ok=False)
-        return SkillResult(prefix + "the arm is at the begin pose", data={"started": False})
+        return SkillResult(prefix + "the arm is at its waiting pose", data={"started": False})
 
 
 class RobotRelease(Skill):

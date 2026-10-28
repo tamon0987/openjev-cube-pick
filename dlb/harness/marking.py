@@ -618,7 +618,9 @@ class OverheadGuide:
             self.seen[name] = p
             if name == self.bin_name:
                 self._static.setdefault(name, []).append(p)
-        if g is not None and self._plausible_gripper(tcp, g):
+        if g is not None and self._parked(tcp):
+            pass  # the arm waits out of the way: only the objects count
+        elif g is not None and self._plausible_gripper(tcp, g):
             self.map.add(tcp, g, sd_px=float(np.hypot(self.GRIPPER_SD_PX, m.spread_px.get("gripper", 0.0))))
         elif g is not None:
             print(
@@ -811,6 +813,12 @@ class OverheadGuide:
             fh.write(json.dumps(rec) + "\n")
 
     GRIPPER_OUTLIER_PX = 40.0
+    PARKED_Z = 0.20  # m: a tcp above this is the wait pose (work heights stay under the 14 cm travel height)
+
+    def _parked(self, tcp: np.ndarray) -> bool:
+        """An image taken with the arm at the wait pose (tcp high above the work heights): the gripper mark is
+        far off its table point there (parallax), so it neither feeds the map nor anchors a move."""
+        return float(np.asarray(tcp)[2]) > self.PARKED_Z
 
     def _plausible_gripper(self, tcp: np.ndarray, g: np.ndarray) -> bool:
         """Once the map rests on two pairs or more, a gripper mark far from the tcp's mapped pixel is a wrong mark
@@ -903,7 +911,7 @@ class OverheadGuide:
                 shot = self.join()
                 ok = (
                     shot is not None
-                    and shot.marks.points.get("gripper") is not None
+                    and (shot.marks.points.get("gripper") is not None or self._parked(shot.tcp))
                     and self._pt(shot.marks, "cube") is not None
                 )
                 rec.update(
@@ -920,7 +928,7 @@ class OverheadGuide:
             if (
                 got is not None
                 and got.kind == "begin"
-                and got.marks.points.get("gripper") is not None
+                and (got.marks.points.get("gripper") is not None or self._parked(got.tcp))
                 and self._pt(got.marks, target) is not None
             ):
                 shot = got
@@ -996,7 +1004,7 @@ class OverheadGuide:
                 )
             shot, px, goal = retry, p2, g2
         here = env.tcp_pos[:2].copy()
-        if shot is not None and shot.marks.points.get("gripper") is not None:
+        if shot is not None and shot.marks.points.get("gripper") is not None and not self._parked(shot.tcp):
             # both marks in the same image: move by their difference from where that image was taken (the map's
             # offset error cancels)
             dest0 = shot.tcp[:2] + goal - self.map.to_table(shot.marks.points["gripper"])

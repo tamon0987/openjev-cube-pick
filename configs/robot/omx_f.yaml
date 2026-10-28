@@ -25,6 +25,10 @@ poses:
   begin: [0.008, -0.515, 0.773, 0.649, 0.0]  # 52 deg pitch: the wrist camera looks ~straight down
   # rest: the leader arm's parked pose (read from it 2026-10-27), joint2 pulled 4 deg inside the firmware limit
   rest: [-0.014, -1.80, 1.523, 1.588, -0.043]
+  # wait: where the arm waits between tasks, pulled back and up (tcp ~26 cm above the base) so it hides nothing in
+  # the overhead view; tasks start and end here, the overhead images are taken here. Shown with the leader arm
+  # 2026-10-28. The start-up calibration still runs around the begin pose.
+  wait: [-0.025, -1.445, 0.247, 1.597, -0.029]
 begin_time_s: 3.0
 # tcp height (m above the table) for reaching / aligning over the cube: from the begin pose the cube fills half the
 # wrist image and the servo stopped with the cross on its edge; from 12 cm it spans about a third.
