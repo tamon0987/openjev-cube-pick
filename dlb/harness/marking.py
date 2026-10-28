@@ -178,11 +178,15 @@ class OverheadMarker:
         )
         return json.loads(text)
 
-    def list_objects(self, img: np.ndarray, flat: bool = False) -> tuple[list[str], str | None]:
+    def list_objects(
+        self, img: np.ndarray, flat: bool = False, known: tuple[str, ...] = ()
+    ) -> tuple[list[str], str | None]:
         """The loose objects on the table and the container to put things into, named by the vision model (one call).
 
         Used when no object names are given: the names then come from what is on the table, not from a fixed list.
         ``flat``: the place is a flat mark on the table (e.g. a cross of tape), not a container.
+        ``known``: names already given to things on this table; the same thing keeps its name (a second name for
+        one object leaves one of the two unmarked later).
         """
         from dlb.contract import image_to_data_url
 
@@ -198,6 +202,13 @@ class OverheadMarker:
             "the cameras and their stands, and the walls. Name each one in 2-4 English words that tell it apart from "
             "the others (its colour and what it is)."
         )
+        if known:
+            prompt += (
+                "\nSome things here already have names: "
+                + ", ".join(known)
+                + ". Use exactly that name for each of "
+                "them (also for the container), and give a new name only to a thing that none of these names fits."
+            )
         schema = {
             "type": "object",
             "properties": {

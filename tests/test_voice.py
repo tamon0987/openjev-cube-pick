@@ -266,3 +266,66 @@ def test_discover_looks_again_when_a_call_misses_the_container(monkeypatch):
     a.env = SimpleNamespace(overhead_frame=lambda: np.zeros((4, 4, 3), np.uint8))
     a.discover()
     assert a.objects == ["red cube", "carrot"] and a.args.bin_name == "black tray"
+
+
+def test_refresh_keeps_the_names_already_given(monkeypatch):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from dlb.harness import marking
+    from dlb.voice.agent import Agent
+
+    seen = {}
+
+    def list_objects(self, img, flat=False, known=()):
+        seen["known"] = known
+        return ["green foam cube", "blue pen"], "black tray"
+
+    monkeypatch.setattr(marking.OverheadMarker, "list_objects", list_objects)
+    a = Agent.__new__(Agent)
+    a.args = SimpleNamespace(mark_model=None, flat_place=False, bin_name="black tray")
+    a.objects = ["green foam cube"]
+    a.state = SimpleNamespace(held=None, place_name="")
+    a.guide = None
+    a.env = SimpleNamespace(overhead_frame=lambda: np.zeros((4, 4, 3), np.uint8))
+    assert a.refresh_objects() == ["blue pen"]
+    assert seen["known"] == ("green foam cube", "black tray")
+
+
+def test_list_objects_asks_to_reuse_the_known_names():
+    import json
+
+    import numpy as np
+
+    from dlb.harness.marking import OverheadMarker
+
+    sent = {}
+
+    class Client:
+        def post(self, path, json=None):
+            sent["prompt"] = json["input"][0]["content"][0]["text"]
+            out = {"objects": ["green foam cube"], "container": "black tray"}
+            return type(
+                "R",
+                (),
+                {
+                    "status_code": 200,
+                    "json": lambda self: {
+                        "output": [
+                            {"type": "message", "content": [{"type": "output_text", "text": dumps(out)}]}
+                        ]
+                    },
+                },
+            )()
+
+    dumps = json.dumps
+    m = OverheadMarker.__new__(OverheadMarker)
+    m.model, m.effort, m.client = "x", None, Client()
+    assert m.list_objects(np.zeros((8, 8, 3), np.uint8), known=("green foam cube", "black tray")) == (
+        ["green foam cube"],
+        "black tray",
+    )
+    assert "green foam cube, black tray" in sent["prompt"]
+    m.list_objects(np.zeros((8, 8, 3), np.uint8))
+    assert "already have names" not in sent["prompt"]

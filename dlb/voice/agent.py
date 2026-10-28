@@ -145,7 +145,9 @@ class Agent:
         from dlb.harness.marking import OverheadMarker
 
         objects, _ = OverheadMarker(model=self.args.mark_model).list_objects(
-            self.env.overhead_frame(), flat=self.args.flat_place
+            self.env.overhead_frame(),
+            flat=self.args.flat_place,
+            known=tuple(n for n in (*self.objects, self.args.bin_name) if n),
         )
         new = [o for o in objects if o != self.args.bin_name and o not in self.objects]
         if new:
