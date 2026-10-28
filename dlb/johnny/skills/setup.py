@@ -466,8 +466,12 @@ class RigSetup(Skill):
             return Check("robot", False, f"robot start failed: {err}")
         # A freshly started robot has calibrated the camera selected by this dialogue.
         ctx.state.pop("cameras_changed", None)
+        env = getattr(agent, "env", None)
+        waiting = env is not None and hasattr(env, "at_pose") and env.at_pose("wait", tol=0.1)
         started.append(
-            "the robot: begin pose, overhead calibrated ("
+            "the robot: "
+            + ("waiting pose (pulled back, out of the overhead view)" if waiting else "begin pose")
+            + ", overhead calibrated ("
             + describe(getattr(agent.guide, "calibration", None))
             + ")"
         )
