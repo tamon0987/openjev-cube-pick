@@ -565,7 +565,7 @@ class FakeEnv:
     def go_pose(self, name):
         self.calls.append(f"go_pose {name}")
 
-    def at_pose(self, name):
+    def at_pose(self, name, tol=0.03):
         return False
 
     def open_gripper(self):
