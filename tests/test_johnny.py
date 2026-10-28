@@ -55,6 +55,8 @@ WAKE_TABLE = [
     ("ジョニーさん、状態を教えて", "command", "状態を教えて"),
     ("ジャニー、ビンの位置は？", "command", "ビンの位置は？"),
     ("あ、ジョニー、抜きました", "command", "抜きました"),
+    ("介助に人参をトレイに入れて、", "command", "人参をトレイに入れて、"),
+    ("介助の仕事について", "none", ""),
     # bare stop words, with or without the wake word
     ("止まって", "stop", ""),
     ("止まって！", "stop", ""),
