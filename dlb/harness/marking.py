@@ -1003,7 +1003,10 @@ class OverheadGuide:
         else:
             dest0 = goal
         step = dest0 - here
-        if np.linalg.norm(step) > self.max_step:
+        if target == "cube" and np.linalg.norm(step) > self.max_step:
+            # one bounded move toward the object (its mark is refined afterwards); the place move is the last
+            # before the release, so it is never cut short: from an object on the right to a tray on the far
+            # left (35 cm) the cut move released the object 10 cm short of the tray
             step *= self.max_step / np.linalg.norm(step)
         dest = np.clip(here + step, [b[0] for b in self.bounds], [b[1] for b in self.bounds])
         err = float(np.linalg.norm(step))

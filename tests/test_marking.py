@@ -657,3 +657,31 @@ def test_reachable_rejects_marks_far_outside_the_work_area():
     assert g._reachable(np.array([0.22, -0.07]))
     assert g._reachable(np.array([0.33, 0.22]))  # within the slack
     assert not g._reachable(np.array([0.349, 0.411]))  # the carrot marked on the laptop
+
+
+def test_the_place_move_is_never_cut_short():
+    """From an object on the right to a tray on the far left (35 cm) the move was capped at 25 cm and the
+    object was released 10 cm short of the tray."""
+
+    class M:
+        names = ("green cube", "black bin")
+
+    g = OverheadGuide(M(), TableMap(px_per_m=700.0))
+    g.set_targets(place="black bin")
+    pts = {"gripper": np.array([410.0, 319.0]), "black bin": np.array([170.0, 357.0])}
+    boxes = {"black bin": np.array([124.0, 314, 217, 400])}
+    g.marker.mark = lambda img: Marks(pts, {k: 1.0 for k in pts}, 0.0, [], boxes)
+
+    class E:
+        tcp_pos = np.array([0.196, -0.099, 0.14])
+
+        def overhead_frame(self):
+            return np.zeros((480, 640, 3), np.uint8)
+
+        def _move_tcp(self, target):
+            self.tcp_pos = np.array(target, float)
+
+    e = E()
+    r = g.goto(e, "bin", 0.12)
+    assert r.ok and r.error_cm > g.max_step
+    assert e.tcp_pos[1] > 0.19  # at the work area's edge over the tray, not 10 cm short of it
