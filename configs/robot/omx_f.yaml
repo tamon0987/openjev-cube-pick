@@ -35,8 +35,9 @@ begin_time_s: 3.0
 observe_z: 0.12
 # Where the wrist servo puts the object relative to the fingers: the green cross is drawn this far (m) ahead of
 # the point below the gripper along the wrist image's "up" (away from the base). Positive = the fingers close
-# nearer the base side of the object (a cube grasped too deep on its far side slipped: 2026-10-28).
-grasp_cross_offset_m: 0.01
+# nearer the base side of the object (a cube grasped too deep on its far side slipped: 2026-10-28; 1 cm, then
+# 2 cm on the owner's request the same day).
+grasp_cross_offset_m: 0.02
 # Fingertip height (m, robot base frame) with the fingertips resting on the table: scripts/real_poses.py --z-floor.
 # null = the table is taken to be the base plane (z = 0).
 z_floor_m: 0.0001
