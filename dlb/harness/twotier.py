@@ -1242,12 +1242,20 @@ class JevBisectServoPolicy(JevServoPolicy):
         super().__init__(*a, **kw)
         self.name = self.name.replace("jev_servo", "jev_bisect")
         self.step0, self.min_step, self.max_moves = step0, min_step, max_moves
+        # set by the runner when the overhead guide has just put the gripper over the target
+        self.overhead_on_target = False
+        self._trust_overhead = False
 
     def _reset(self, sub: Subtask) -> None:
         super()._reset(sub)
         for ax in ("h", "v"):
             self._state[ax].update(step=self.step0, flipped=False)
         self._moves = 0
+        # The wrist "is the target visible?" answer is unreliable up close: a cube right below the camera looks
+        # like a large pink/green patch, not a cube, and was answered "not visible" (p 0.02) while the overhead
+        # mark had the gripper 0.3 cm from it. After a guided move, align on the side answers instead; a miss
+        # is caught by the grasp check and recovered.
+        self._trust_overhead, self.overhead_on_target = self.overhead_on_target, False
 
     def decide(self, env: PickPlaceEnv, sub: Subtask, images: dict[str, np.ndarray]) -> Decision:
         if self._key != sub.uid:
@@ -1273,7 +1281,12 @@ class JevBisectServoPolicy(JevServoPolicy):
             return Decision("SUBTASK_DONE", 1.0)
         ans, lat, tok = self._ask(env, sub, images, todo)
         wire = {f"{ax}_{k}": v.to_wire() for ax in todo for k, v in ans[ax].items()}
-        if "h" in ans and "visible" in ans["h"] and ans["h"]["visible"].noul < 0.5:
+        if (
+            "h" in ans
+            and "visible" in ans["h"]
+            and ans["h"]["visible"].noul < 0.5
+            and not self._trust_overhead
+        ):
             return Decision(sub.search or "ESCALATE", ans["h"]["visible"].conf, wire, lat, tok)
         move = {"h": 0.0, "v": 0.0}
         confs = []
@@ -1703,6 +1716,8 @@ class TwoTierRunner:
             }
         )
         if r.ok:
+            if target == "cube" and hasattr(self.policy, "overhead_on_target"):
+                self.policy.overhead_on_target = True  # the next wrist alignment trusts this
             return None
         event(sub, "escalated", f"overhead guide: {r.reason}", r.iterations)
         res.escalations += 1

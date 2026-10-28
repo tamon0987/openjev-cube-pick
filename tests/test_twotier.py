@@ -204,3 +204,28 @@ def test_cross_point_shifts_along_the_wrist_up_axis():
     assert np.allclose(p, [0.2, 0.01, 0.015])  # 1 cm along "up" (here +y), at the asked height
     Env.cross_offset_fwd = 0.0
     assert np.allclose(cross_point(Env(), 0.015), [0.2, 0.0, 0.015])
+
+
+def test_bisect_servo_trusts_the_overhead_guide_over_a_not_visible_wrist_answer():
+    """Up close the wrist model answered "red cube not visible" (p 0.02) with the cube under the cross; after
+    a guided move the servo aligns on the side answers instead of escalating, once per guided move."""
+    from dlb.contract import Answer
+
+    def ask(env, sub, images, axes):
+        side = {"left": 0.62, "right": 0.38}
+        ans = {ax: {"side": Answer(type="choice", choice="left", probabilities=side)} for ax in axes}
+        if "h" in ans:
+            ans["h"]["visible"] = Answer(type="noul", noul=0.02)
+        return ans, 0.0, 0
+
+    policy = JevBisectServoPolicy(backend=None)
+    policy._ask = ask
+    env = SimpleNamespace(tcp_pos=np.array([0.16, -0.07, 0.114]), aperture=OPEN_MIN + 0.01, held=False)
+
+    def align(uid: int) -> Subtask:
+        return Subtask("align_cube", "", "", SUBTASKS["align_cube"], step_cm=1.0, uid=uid)
+
+    assert policy.decide(env, align(1), {}).command == "ESCALATE"
+    policy.overhead_on_target = True
+    assert policy.decide(env, align(2), {}).command == "SUBTASK_DONE"  # unsure sides: close enough
+    assert policy.decide(env, align(3), {}).command == "ESCALATE"  # the trust is used up
