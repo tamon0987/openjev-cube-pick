@@ -666,6 +666,10 @@ class FakeAgent:
         self.marks += 1
         self.guide.pending = "begin"
 
+    def ensure_fresh_marks(self):
+        self.fresh_checks = getattr(self, "fresh_checks", 0) + 1
+        return False
+
 
 @pytest.fixture
 def agent(fake, monkeypatch):

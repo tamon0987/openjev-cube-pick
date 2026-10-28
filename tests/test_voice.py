@@ -199,3 +199,26 @@ def test_listen_from_file_with_mock_server(tmp_path):
     utts = list(listen(file_frames(path), tr))
     assert len(got) == 2  # two utterances sent
     assert [u.text for u in utts] == ["赤いキューブ"]  # the stock hallucination is dropped
+
+
+def test_agent_marks_again_before_a_task_when_the_table_changed_since_the_idle_mark():
+    from dlb.voice.agent import Agent
+
+    class Guide:
+        pending, resets = "", 0
+
+        def reset(self):
+            self.resets += 1
+
+    a = Agent.__new__(Agent)
+    a.guide, a._ref = Guide(), np.zeros((120, 160), int)
+    marked = []
+    a.idle_mark = lambda: marked.append(1)
+    a._small = lambda: np.zeros((120, 160), int)
+    assert not a.ensure_fresh_marks() and not marked  # same view: the idle mark is used
+    moved = np.zeros((120, 160), int)
+    moved[50:56, 70:76] = 200  # a ~3 cm object moved
+    a._small = lambda: moved
+    assert a.ensure_fresh_marks() and marked == [1] and a.guide.resets == 1
+    a._ref = None  # no idle mark yet: nothing to compare
+    assert not a.ensure_fresh_marks()

@@ -319,6 +319,7 @@ class PickPlace(Skill):
         attempts, verdict, r = 0, None, None
         try:
             return_to_begin(ctx, agent)
+            agent.ensure_fresh_marks()  # the overhead image is of the table as it is now
             ctx.say("実行します。")
             while True:
                 attempts += 1

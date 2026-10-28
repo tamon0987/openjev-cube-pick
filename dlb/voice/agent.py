@@ -149,6 +149,20 @@ class Agent:
         except Exception as e:  # noqa: BLE001 - the next task then marks in the foreground
             print("  idle mark failed:", e, file=sys.stderr)
 
+    def ensure_fresh_marks(self) -> bool:
+        """Before a task: when the overhead view differs from the one the idle mark was made from (an object
+        was moved after the last task), forget that mark and mark the current view. Returns True when it did.
+        The idle mark is made right after a task; without this check a cube moved since then was looked for
+        where it used to be."""
+        if self.guide is None or self._ref is None:
+            return False
+        if not self._changed(self._small(), self._ref):
+            return False
+        print("  the scene changed since the last mark: marking again", flush=True)
+        self.guide.reset()  # forget the old marks (the map is kept)
+        self.idle_mark()
+        return True
+
     def _small(self):
         """The overhead view as a small grey image (cheap to compare)."""
         import cv2
