@@ -247,3 +247,22 @@ def test_agent_waits_at_the_wait_pose_and_starts_tasks_from_the_begin_pose():
     env.held, env.cfg = False, {"poses": {}}
     a.park()  # no wait pose configured: the begin pose stays the home
     assert moves == ["wait", "begin"]
+
+
+def test_discover_looks_again_when_a_call_misses_the_container(monkeypatch):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from dlb.harness import marking
+    from dlb.voice.agent import Agent
+
+    answers = iter([(["red cube"], None), (["red cube", "carrot"], "black tray")])
+    monkeypatch.setattr(marking.OverheadMarker, "list_objects", lambda self, img, flat=False: next(answers))
+    a = Agent.__new__(Agent)
+    a.args = SimpleNamespace(mark_model=None, flat_place=False, bin_name=None)
+    a.objects = []
+    a.state = SimpleNamespace(held=None, place_name=None)
+    a.env = SimpleNamespace(overhead_frame=lambda: np.zeros((4, 4, 3), np.uint8))
+    a.discover()
+    assert a.objects == ["red cube", "carrot"] and a.args.bin_name == "black tray"

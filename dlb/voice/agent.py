@@ -123,11 +123,14 @@ class Agent:
         """Name the objects on the table and the container from the overhead image (the ones not given)."""
         from dlb.harness.marking import OverheadMarker
 
-        objects, container = OverheadMarker(model=self.args.mark_model).list_objects(
-            self.env.overhead_frame(), flat=self.args.flat_place
-        )
-        self.objects = self.objects or [o for o in objects if o != self.args.bin_name]
-        self.args.bin_name = self.args.bin_name or container
+        marker = OverheadMarker(model=self.args.mark_model)
+        for _ in range(3):  # one call now and then misses the container or names nothing: look again
+            objects, container = marker.list_objects(self.env.overhead_frame(), flat=self.args.flat_place)
+            objects = self.objects or [o for o in objects if o != self.args.bin_name]
+            container = self.args.bin_name or container
+            if objects and container:
+                break
+        self.objects, self.args.bin_name = objects, container
         print(
             f"  on the table: {', '.join(self.objects) or '-'}; container: {self.args.bin_name or '-'}",
             flush=True,
