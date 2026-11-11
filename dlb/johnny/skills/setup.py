@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,6 +31,9 @@ class Check:
 def check_cameras(cfg: dict[str, Any], ctx: Context, frames: bool = True) -> list[Check]:
     """Each configured camera: known device, present, and (``frames``) gives a frame."""
     present = {str(p) for p in rig.list_cameras()}
+    # the started robot holds the cameras open (a second open gives nothing): judge by its latest frames
+    env = getattr(ctx.robot, "env", None)
+    held = getattr(env, "frame_t", None)
     out = []
     jp = {"wrist": "手首カメラ", "front": "俯瞰カメラ"}
     for cam in ("wrist", "front"):
@@ -51,6 +55,19 @@ def check_cameras(cfg: dict[str, Any], ctx: Context, frames: bool = True) -> lis
                     suggest="identify_cameras",
                 )
             )
+        elif frames and held is not None:
+            if time.monotonic() - held.get(cam, float("-inf")) < 2.0:
+                out.append(Check(f"camera {cam}", True, f"{cam} camera ok (streaming to the robot)"))
+            else:
+                out.append(
+                    Check(
+                        f"camera {cam}",
+                        False,
+                        f"{cam} camera stopped streaming to the robot (unplugged while in use?)",
+                        ask=f"{jp[cam]}の映像が止まっています。「停止して」でロボットを止めてから、"
+                        "もう一度セットアップしてください。",
+                    )
+                )
         elif frames and rig.grab_frame(dev) is None:
             out.append(
                 Check(

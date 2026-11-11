@@ -430,6 +430,7 @@ class RealOMX(PickPlaceEnv):
         }
 
         self._frames: dict[str, np.ndarray] = {}
+        self.frame_t: dict[str, float] = {}  # monotonic time of each camera's latest frame
         self._caps = {}
         self._cam_stop = threading.Event()
         self._cam_threads: list[threading.Thread] = []
@@ -454,6 +455,7 @@ class RealOMX(PickPlaceEnv):
                     ok, f = cap.read()
                     if ok:
                         self._frames[name] = f if rot is None else cv2.rotate(f, rot)
+                        self.frame_t[name] = time.monotonic()
 
             t = threading.Thread(target=reader, daemon=True)
             t.start()

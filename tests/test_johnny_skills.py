@@ -1385,3 +1385,14 @@ def test_setup_existing_driver_on_wrong_port_blocks_start(fake, ctx):
     r = setup.RigSetup().run(ctx)
     assert not r.ok and "一致しません" in r.text
     assert not fake.spawned
+
+
+def test_cameras_held_by_the_robot_are_judged_by_its_latest_frames(fake, ctx):
+    import time
+
+    fake.frames = {WRIST: False, FRONT: False}  # a second open of a device the robot holds gives nothing
+    now = time.monotonic()
+    ctx.robot = SimpleNamespace(env=SimpleNamespace(frame_t={"wrist": now, "front": now - 10.0}))
+    checks = {c.name: c for c in setup.check_cameras(rig.load_config(ctx.robot_config), ctx)}
+    assert checks["camera wrist"].ok is True
+    assert checks["camera front"].ok is False and "停止して" in checks["camera front"].ask
