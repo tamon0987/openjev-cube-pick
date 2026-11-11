@@ -6,7 +6,9 @@
 
 Utterances without the wake word never leave the laptop. A request runs in a worker thread (the LLM call, the
 tools it picks, the reply), so a stop word heard meanwhile cancels the running skill at once. One request at a
-time: a second wake-word request while one runs is answered with 「作業中です」.
+time: a second wake-word request while one runs cuts in: the running skill is cancelled (as by a stop word) and
+the new request runs once it has returned; said with 「終わったら」「次に」 and the like, it waits for the running one
+to finish instead.
 """
 
 from __future__ import annotations
@@ -32,7 +34,21 @@ from dlb.johnny.skills.registry import Registry
 from dlb.johnny.speak import Speaker
 from dlb.johnny.wake import WakeGate, WakeWord
 
-BUSY_REPLY = "作業中です。止めるときは「止まって」と言ってください。"
+INTERRUPT_REPLY = "今の作業を止めて、そちらに移ります。"
+AFTER_REPLY = "今の作業が終わったら、それをやります。"
+INTERRUPTED_REPLY = "途中で止めて、次の指示に移ります。"
+# words that ask for a request to wait for the running one instead of cutting in
+AFTER_WORDS = (
+    "終わったら",
+    "終わってから",
+    "済んだら",
+    "済んでから",
+    "そのあと",
+    "その後",
+    "次に",
+    "あとで",
+    "後で",
+)
 WAKE_REPLY = "はい、どうぞ。"
 STOPPED_REPLY = "止めました。"
 STOP_USER_TEXT = "止まって"
@@ -80,6 +96,7 @@ class Johnny:
         self._asking: Skill | None = None  # the skill waiting for the user's answer (ask_user)
         self._cancelled = threading.Event()
         self._lock = threading.Lock()
+        self._pending: str | None = None  # a request heard while another ran; runs when that one returns
 
     # ------------------------------------------------------------ input
 
@@ -102,13 +119,36 @@ class Johnny:
         if m.kind == "command":
             self.log(f"command ({m.matched}): {m.command!r}")
             if self.busy:
-                self.speaker.say(BUSY_REPLY)
-                return "busy"
+                return self.cut_in(m.command)
             self.request(m.command)
             return "command"
         if self.debug:
             self.log(f"ignored (no wake word): {text!r}")
         return "ignored"
+
+    def cut_in(self, text: str) -> str:
+        """A request while another runs: it runs next (the latest one if several), after cancelling the running
+        skill unless the words ask it to wait (``AFTER_WORDS``). Returns "queued" (waits) or "interrupt"."""
+        after = any(w in text for w in AFTER_WORDS)
+        with self._lock:
+            self._pending = text
+        if after:
+            self.log("  runs after the current request")
+            self.speaker.say(AFTER_REPLY)
+            return "queued"
+        self.log("  cuts in: cancelling the current request")
+        self.speaker.say(INTERRUPT_REPLY)
+        self._cancelled.set()
+        with self._lock:
+            running, asking = self._running, self._asking
+            self._asking = None
+        for s in (running, asking):
+            if s is not None:
+                try:
+                    s.cancel(self.ctx)
+                except Exception as e:  # noqa: BLE001
+                    self.log(f"cancel {s.name} failed: {e}")
+        return "interrupt"
 
     # ------------------------------------------------------------ requests
 
@@ -127,6 +167,11 @@ class Johnny:
             self.log(f"request failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
             reply = "すみません、処理に失敗しました。もう一度お願いします。"
         self.history.assistant(reply)
+        with self._lock:
+            pending, self._pending = self._pending, None
+        if pending is not None:
+            self.request(pending)  # a new worker; this one ends here
+            return
         self.speaker.say(reply)
         # the user answers without the wake word: a longer window when a skill waits for a physical step
         if self._asking is not None:
@@ -151,6 +196,8 @@ class Johnny:
                 break
         else:
             return reply.text or "ここまでで一度止めます。続けるならもう一度言ってください。"
+        if self._pending is not None:
+            return INTERRUPTED_REPLY  # the next request follows at once: no reply of its own
         reply = self.llm.respond(self.history.snapshot(), [])  # after a stop: just tell the user
         return reply.text or STOPPED_REPLY
 
@@ -187,6 +234,8 @@ class Johnny:
         ``word`` is the matched stop word: the stop skill may treat 停止/終了 while idle as a safe stop."""
         self._cancelled.set()
         self.gate.disarm("stop")
+        with self._lock:
+            self._pending = None  # a stop word drops a request that was to come next
         with self._lock:
             running, asking = self._running, self._asking
             self._asking = None

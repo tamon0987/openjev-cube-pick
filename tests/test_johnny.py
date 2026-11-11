@@ -8,8 +8,9 @@ import httpx
 import pytest
 
 from dlb.johnny.agent import (
-    BUSY_REPLY,
+    AFTER_REPLY,
     CANCELLED_OUTPUT,
+    INTERRUPT_REPLY,
     STOPPED_REPLY,
     WAKE_REPLY,
     Johnny,
@@ -346,7 +347,6 @@ def test_stop_word_cancels_the_running_skill():
     j.hear("ジョニー、長い作業をして")
     assert fake.started.wait(5.0)
     assert j.busy
-    assert j.hear("ジョニー、何か") == "busy" and sp.lines[-1] == BUSY_REPLY
     assert j.hear("止まって") == "stop"  # no wake word needed
     _wait(j)
     assert fake.cancelled == 1 and stop.calls == 1
@@ -622,3 +622,70 @@ def test_speaker_marks_its_own_speech():
     (s, e), *_ = sp._spans
     assert sp.overlaps(s - 1.0, s + 0.001) and sp.overlaps(e, e + 0.3)
     assert not sp.overlaps(e + 1.0, e + 2.0) and not sp.overlaps(s - 3.0, s - 1.0)
+
+
+class QuickSkill(FakeSkill):
+    name = "quick"
+
+
+def _wait_all(j: Johnny, timeout_s: float = 5.0) -> None:
+    """Until no request runs (a request heard meanwhile starts a new worker)."""
+    t0 = time.monotonic()
+    while j.busy and time.monotonic() - t0 < timeout_s:
+        j._worker.join(0.05)
+    assert not j.busy
+
+
+def test_a_new_request_cuts_in_on_the_running_one():
+    seen: list = []
+    llm = scripted(
+        [
+            [_call("fake", {"what": "long"})],
+            [_call("quick", {"what": "b"}, "c2")],
+            [_message("b をやりました。")],
+        ],
+        seen,
+    )
+    fake, quick, stop = FakeSkill(block=True), QuickSkill(), StopSkill()
+    j, sp = _johnny([fake, quick, stop], llm)
+    j.hear("ジョニー、長い作業をして")
+    assert fake.started.wait(5.0)
+    assert j.hear("ジョニー、やっぱり b をして") == "interrupt" and sp.lines[-1] == INTERRUPT_REPLY
+    _wait_all(j)
+    assert fake.cancelled == 1 and stop.calls == 0  # only the running skill is cancelled
+    assert quick.calls == [{"what": "b"}] and sp.lines[-1] == "b をやりました。"
+    users = [it["content"][0]["text"] for it in j.history.items if it.get("role") == "user"]
+    assert users == ["長い作業をして", "やっぱり b をして"]
+    assert len(seen) == 3  # no reply of its own for the request that was cut short
+
+
+def test_a_request_said_for_afterwards_waits_for_the_running_one():
+    llm = scripted(
+        [
+            [_call("fake", {"what": "long"})],
+            [_message("long をやりました。")],
+            [_call("quick", {"what": "b"}, "c2")],
+            [_message("b をやりました。")],
+        ]
+    )
+    fake, quick = FakeSkill(block=True), QuickSkill()
+    j, sp = _johnny([fake, quick], llm)
+    j.hear("ジョニー、長い作業をして")
+    assert fake.started.wait(5.0)
+    assert j.hear("ジョニー、それが終わったら b をして") == "queued" and sp.lines[-1] == AFTER_REPLY
+    assert fake.cancelled == 0
+    fake._stop.set()  # the long one finishes by itself
+    _wait_all(j)
+    assert quick.calls == [{"what": "b"}] and sp.lines[-1] == "b をやりました。"
+
+
+def test_a_stop_word_drops_the_request_that_was_to_come_next():
+    llm = scripted([[_call("fake", {"what": "long"})], [_message("止めました。")]])
+    fake, quick = FakeSkill(block=True), QuickSkill()
+    j, sp = _johnny([fake, quick], llm)
+    j.hear("ジョニー、長い作業をして")
+    assert fake.started.wait(5.0)
+    j.hear("ジョニー、次に b をして")
+    j.hear("止まって")
+    _wait_all(j)
+    assert quick.calls == [] and sp.lines[-1] == "止めました。"
