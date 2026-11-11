@@ -206,8 +206,9 @@ class OverheadMarker:
             prompt += (
                 "\nSome things here already have names: "
                 + ", ".join(known)
-                + ". Use exactly that name for each of "
-                "them (also for the container), and give a new name only to a thing that none of these names fits."
+                + ". Some of them may have been taken away and other things put down since. Use exactly that name "
+                "for a thing only when it is the very same thing: same colour and same kind (also for the container). "
+                "A thing of another colour or kind gets a new name of its own, even where a named thing lay before."
             )
         schema = {
             "type": "object",
